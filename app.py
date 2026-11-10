@@ -58,8 +58,9 @@ st.markdown("""
         border-radius: 5px;
         text-align: center;
     }
-    .pred-high { color: #00cc66; font-size: 24px; font-weight: bold; }
-    .pred-low { color: #ff3333; font-size: 24px; font-weight: bold; }
+    .pred-high { color: #00cc66; font-size: 20px; font-weight: bold; }
+    .pred-low { color: #ff3333; font-size: 20px; font-weight: bold; }
+    .pred-neutral { color: #ffcc00; font-size: 16px; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -73,7 +74,6 @@ if 'portfolio_sweeps' not in st.session_state:
 if 'total_gold_units' not in st.session_state:
     st.session_state.total_gold_units = 0.0
 
-# Background Job Queue State
 if "bg_queue" not in st.session_state:
     st.session_state.bg_queue = []
 if "bg_results" not in st.session_state:
@@ -89,13 +89,12 @@ if "total_to_process" not in st.session_state:
 def get_fast_session():
     """Creates a session optimized for speed to prevent UI hangs."""
     session = requests.Session()
-    # Shorter retries, much faster backoff to prevent hanging on tarpitted IPs
     retry = Retry(connect=2, backoff_factor=0.2, status_forcelist=[429, 500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'application/json'
     })
     return session
@@ -119,7 +118,6 @@ def fetch_single_ticker(ticker, p1, p2, session):
     ]
     for url in endpoints:
         try:
-            # STRICT 3 SECOND TIMEOUT to prevent the app from hanging
             res = session.get(url, timeout=3)
             if res.status_code == 200:
                 result = res.json().get('chart', {}).get('result', [])
@@ -137,7 +135,7 @@ def fetch_single_ticker(ticker, p1, p2, session):
 
 @st.cache_data(ttl=3600)
 def fetch_macro_data(days=250):
-    """Concurrent, resilient macro fetcher that never hangs."""
+    """Concurrent, resilient macro fetcher."""
     tickers = ["DX-Y.NYB", "BZ=F", "^NSEI", "GOLDIETF.NS", "INR=X", "EURUSD=X", "GBPUSD=X", "JPY=X"]
     session = get_fast_session()
     
@@ -147,7 +145,6 @@ def fetch_macro_data(days=250):
     
     data_frames = []
     
-    # Fetch all macro tickers concurrently to speed up the UI
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(fetch_single_ticker, t, p1, p2, session): t for t in tickers}
         for future in concurrent.futures.as_completed(futures):
@@ -165,7 +162,7 @@ def fetch_macro_data(days=250):
 
 @st.cache_data(ttl=1800)
 def fetch_gold_predictions(ticker="GOLDIETF.NS"):
-    """Calculates next-day High/Low execution triggers using 14-day Average True Range (ATR)."""
+    """Calculates next-day High/Low execution triggers (ATR Breakouts) and SEBI bands."""
     session = get_fast_session()
     try:
         url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?range=30d&interval=1d"
@@ -187,18 +184,23 @@ def fetch_gold_predictions(ticker="GOLDIETF.NS"):
             atr_14 = df['TR'].rolling(14).mean().iloc[-1]
             last_close = df['Close'].iloc[-1]
             
-            pred_high = last_close + (atr_14 * 1.5)
-            pred_low = last_close - (atr_14 * 1.5)
+            # Algorithmic Triggers based on Research Architecture
+            buy_stop_breakout = last_close + (0.3 * atr_14)
+            dynamic_stop_loss = last_close - (1.5 * atr_14)
+            sebi_upper_band = last_close * 1.06
+            sebi_lower_band = last_close * 0.94
             
             return {
                 "last_close": last_close,
                 "atr": atr_14,
-                "pred_high": pred_high,
-                "pred_low": pred_low
+                "breakout_buy": buy_stop_breakout,
+                "dynamic_stop": dynamic_stop_loss,
+                "sebi_upper": sebi_upper_band,
+                "sebi_lower": sebi_lower_band
             }
-    except Exception as e:
+    except Exception:
         pass
-    return {"last_close": 0, "atr": 0, "pred_high": 0, "pred_low": 0}
+    return {"last_close": 0, "atr": 0, "breakout_buy": 0, "dynamic_stop": 0, "sebi_upper": 0, "sebi_lower": 0}
 
 # ==========================================
 # 3. Sidebar Configuration
@@ -209,7 +211,7 @@ index_choice = st.sidebar.selectbox("Select Target NSE Universe", ["nifty50", "n
 universe_tickers = fetch_nse_index_tickers(index_choice)
 
 with st.sidebar.expander("Equity Universe Selection", expanded=True):
-    st.info("💡 Background Queue Enabled: You can now process up to 500 stocks without timeouts.")
+    st.info("💡 Background Queue Enabled: You can process up to 500 stocks without timeouts.")
     selected_tickers = st.multiselect("Select NSE Equities (Without .NS)", options=universe_tickers, default=universe_tickers[:10])
 
 with st.sidebar.expander("Composite Signal Weightings"):
@@ -251,7 +253,6 @@ def process_symbol_chunk(symbols):
     records = []
     session = get_fast_session()
     
-    # 1. Fetch Prices for the chunk concurrently
     end_date = datetime.today()
     start_date = end_date - timedelta(days=200)
     p1, p2 = int(start_date.timestamp()), int(end_date.timestamp())
@@ -265,7 +266,6 @@ def process_symbol_chunk(symbols):
             if not df.empty:
                 price_data[f"{sym}.NS"] = df[f"{sym}.NS"]
 
-    # 2. Fetch Fundamentals & Process Math
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -275,7 +275,6 @@ def process_symbol_chunk(symbols):
             for sym in symbols:
                 yf_sym = f"{sym}.NS"
                 try:
-                    # Quick Yahoo summary fetch
                     info_url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{yf_sym}?modules=summaryDetail,defaultKeyStatistics"
                     pe_yf, ev_ebitda_yf = 0.0, 0.0
                     try:
@@ -396,22 +395,25 @@ with tab1:
         colC.metric("LPPLS Criticality", f"{round(gold_tc,1)} days", delta="LIQUIDATION WARNING" if gold_tc <= 30 else "Safe", delta_color="inverse" if gold_tc<=30 else "normal")
         colD.metric("Macro NLP Sentiment", sentiment, delta="Bullish" if sentiment > 0.05 else "Bearish" if sentiment < -0.05 else "Neutral")
 
-        # Predictive Execution Box
-        if gold_preds["pred_high"] > 0:
+        # Predictive Execution Box (SEBI 2026 Bands + Volatility Breakout)
+        if gold_preds["breakout_buy"] > 0:
             st.markdown(f"""
             <div class="pred-box">
-                <p style="margin:0; color:#aaa; font-size:14px;">Next Session ETF Execution Bounds (14-Day ATR Implied)</p>
+                <p style="margin:0; color:#aaa; font-size:14px;">Next Session Algorithmic Execution Triggers (SEBI 2026 Rules & 14-Day ATR)</p>
                 <div style="display:flex; justify-content:space-around; align-items:center; margin-top:10px;">
                     <div>
-                        <span style="color:#aaa; font-size:14px;">Expected Low Entry</span><br>
-                        <span class="pred-low">₹{gold_preds['pred_low']:.2f}</span>
+                        <span style="color:#aaa; font-size:12px;">Dynamic Stop Loss (Entry - 1.5 ATR)</span><br>
+                        <span class="pred-low">₹{gold_preds['dynamic_stop']:.2f}</span>
+                        <br><span style="color:#666; font-size:10px;">SEBI Lower Limit: ₹{gold_preds['sebi_lower']:.2f}</span>
                     </div>
                     <div>
-                        <span style="color:#888; font-size:12px;">Current Volatility (ATR): ₹{gold_preds['atr']:.2f}</span>
+                        <span class="pred-neutral">Current ATR: ₹{gold_preds['atr']:.2f}</span><br>
+                        <span style="color:#888; font-size:11px;">(Base SEBI Band: ±6%)</span>
                     </div>
                     <div>
-                        <span style="color:#aaa; font-size:14px;">Expected High Target</span><br>
-                        <span class="pred-high">₹{gold_preds['pred_high']:.2f}</span>
+                        <span style="color:#aaa; font-size:12px;">Breakout Buy Trigger (Open + 0.3 ATR)</span><br>
+                        <span class="pred-high">₹{gold_preds['breakout_buy']:.2f}</span>
+                        <br><span style="color:#666; font-size:10px;">SEBI Upper Limit: ₹{gold_preds['sebi_upper']:.2f}</span>
                     </div>
                 </div>
             </div>
@@ -449,13 +451,13 @@ with tab1:
                 fig_corr.update_layout(margin=dict(l=20, r=20, t=20, b=20), paper_bgcolor="rgba(0,0,0,0)")
                 st.plotly_chart(fig_corr, use_container_width=True)
     else:
-        st.warning("⚠️ Macroeconomic data degraded. YFinance APIs may be experiencing heavy rate-limiting. Using Neutral fallback multipliers.")
+        st.error("Insufficient macroeconomic data retrieved. API may be rate-limited.")
         macro_multiplier, gold_px = 1.0, 0.0
 
 # --- TAB 2: BACKGROUND EQUITY RANKER ---
 with tab2:
     st.header(f"Background Power Law Ranker ({index_choice.upper()} Universe)")
-    st.write("This engine uses an iterative background queue to process hundreds of stocks without timing out the server. It fetches data in chunks of 5.")
+    st.write("Iterative background queue processing to bypass Streamlit Cloud timeouts.")
     
     col_btn, col_prog = st.columns([1, 3])
     with col_btn:
@@ -517,20 +519,24 @@ with tab2:
 
 # --- TAB 3: SWEEP CALCULATOR ---
 with tab3:
-    st.header("Systematic Wealth Accumulation: ICICI Gold ETF Sweep Protocol")
+    st.header("Wealth Accumulation: Gold ETF Sweep Protocol (Union Budget 2024 Rules)")
+    st.markdown(f"**Execution Directive:** Sweep **{profit_sweep_pct}%** of realized short-term equity profits into physical Gold ETF accumulation.")
     
     with st.form("sweep_form", clear_on_submit=True):
-        trade_profit = st.number_input("Realized Profit from Closed Equity Trade (INR)", min_value=0.0, step=1000.0)
+        trade_profit = st.number_input("Gross Profit from Closed Equity Trade (INR)", min_value=0.0, step=1000.0)
         submitted = st.form_submit_button("Execute Profit Sweep")
         
         if submitted and trade_profit > 0 and gold_px > 0:
-            sweep_amt = trade_profit * (profit_sweep_pct / 100.0)
+            # Union Budget 2024 tax deductions applied before sweeping[cite: 12, 59]
+            net_equity_profit = trade_profit * 0.80  # Subtracting 20% STCG
+            sweep_amt = net_equity_profit * (profit_sweep_pct / 100.0)
             units_bought = math.floor(sweep_amt / gold_px)
             actual_cost = units_bought * gold_px
             
             new_record = pd.DataFrame([{
                 'Date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'Trade_Profit_INR': trade_profit,
+                'Gross_Equity_Profit': trade_profit,
+                'Net_Post_Tax_Profit': net_equity_profit,
                 'Sweep_Amount_INR': actual_cost,
                 'Gold_ETF_Price': gold_px,
                 'Units_Accumulated': units_bought
@@ -544,5 +550,9 @@ with tab3:
     if not st.session_state.portfolio_sweeps.empty:
         st.write("### Tactical Accumulation Ledger")
         st.dataframe(st.session_state.portfolio_sweeps, use_container_width=True)
+        
         total_value = st.session_state.total_gold_units * gold_px
-        st.info(f"**Total Gold Vault Balance:** {st.session_state.total_gold_units} Units | **Current Market Value:** ₹{total_value:,.2f}")
+        gold_ltcg = total_value * 0.125 # 12.5% LTCG assumption on exit without indexation[cite: 12, 60]
+        net_liquid_value = total_value - gold_ltcg
+        
+        st.info(f"**Total Gold Vault Balance:** {st.session_state.total_gold_units} Units | **Gross Market Value:** ₹{total_value:,.2f} | **Net Liquid Value (After 12.5% LTCG):** ₹{net_liquid_value:,.2f}")
