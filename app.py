@@ -18,6 +18,7 @@ from playwright.sync_api import sync_playwright
 import nest_asyncio
 import feedparser
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+import concurrent.futures
 
 # ==========================================
 # 0. Infrastructure & OS Patches
@@ -83,52 +84,43 @@ if "total_to_process" not in st.session_state:
     st.session_state.total_to_process = 0
 
 # ==========================================
-# 2. Resilient Market Data Fetcher
+# 2. Ultra-Fast Resilient Market Data Fetcher
 # ==========================================
-def get_robust_session():
-    """Creates a robust requests session with retries to bypass basic YF rate limits."""
+def get_fast_session():
+    """Creates a session optimized for speed to prevent UI hangs."""
     session = requests.Session()
-    retry = Retry(connect=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    # Shorter retries, much faster backoff to prevent hanging on tarpitted IPs
+    retry = Retry(connect=2, backoff_factor=0.2, status_forcelist=[429, 500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
-    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'})
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json'
+    })
     return session
 
 @st.cache_data(ttl=86400)
 def fetch_nse_index_tickers(index_name="nifty50"):
     url = f"https://nsearchives.nseindia.com/content/indices/ind_{index_name}list.csv"
     try:
-        r = get_robust_session().get(url, timeout=10)
+        r = get_fast_session().get(url, timeout=5)
         if r.status_code == 200:
             return pd.read_csv(io.StringIO(r.text))["Symbol"].tolist()
     except Exception:
         pass
     return ["RECLTD", "PFC", "ZOMATO", "TATASTEEL", "ITC", "WIPRO", "ONGC"] 
 
-@st.cache_data(ttl=3600)
-def fetch_macro_data(days=250):
-    """Highly resilient macro fetcher."""
-    # Included Major Currencies: USD/INR, EUR/USD, GBP/USD, USD/JPY
-    tickers = ["DX-Y.NYB", "BZ=F", "^NSEI", "GOLDIETF.NS", "INR=X", "EURUSD=X", "GBPUSD=X", "JPY=X"]
-    session = get_robust_session()
-    
-    try:
-        df = yf.download(tickers, period=f"{days}d", session=session, progress=False)['Close']
-        if not df.empty and len(df) > 10:
-            return df.ffill().dropna()
-    except Exception as e:
-        print(f"YF primary fetch failed: {e}")
-        
-    end_date = datetime.today()
-    start_date = end_date - timedelta(days=days)
-    p1, p2 = int(start_date.timestamp()), int(end_date.timestamp())
-    
-    data = pd.DataFrame()
-    for t in tickers:
-        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{t}?period1={p1}&period2={p2}&interval=1d"
+def fetch_single_ticker(ticker, p1, p2, session):
+    """Fetches a single ticker directly from Yahoo REST API with strict timeouts."""
+    endpoints = [
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?period1={p1}&period2={p2}&interval=1d",
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?period1={p1}&period2={p2}&interval=1d"
+    ]
+    for url in endpoints:
         try:
-            res = session.get(url, timeout=10)
+            # STRICT 3 SECOND TIMEOUT to prevent the app from hanging
+            res = session.get(url, timeout=3)
             if res.status_code == 200:
                 result = res.json().get('chart', {}).get('result', [])
                 if result:
@@ -138,20 +130,46 @@ def fetch_macro_data(days=250):
                     if valid_data:
                         v_ts, v_c = zip(*valid_data)
                         dates = pd.to_datetime(v_ts, unit='s').dt.date
-                        df_t = pd.DataFrame({t: v_c}, index=dates)
-                        data = df_t if data.empty else data.join(df_t, how='outer')
+                        return pd.DataFrame({ticker: v_c}, index=dates)
         except Exception:
-            pass
-            
-    return data.ffill().dropna()
+            continue
+    return pd.DataFrame()
+
+@st.cache_data(ttl=3600)
+def fetch_macro_data(days=250):
+    """Concurrent, resilient macro fetcher that never hangs."""
+    tickers = ["DX-Y.NYB", "BZ=F", "^NSEI", "GOLDIETF.NS", "INR=X", "EURUSD=X", "GBPUSD=X", "JPY=X"]
+    session = get_fast_session()
+    
+    end_date = datetime.today()
+    start_date = end_date - timedelta(days=days)
+    p1, p2 = int(start_date.timestamp()), int(end_date.timestamp())
+    
+    data_frames = []
+    
+    # Fetch all macro tickers concurrently to speed up the UI
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(fetch_single_ticker, t, p1, p2, session): t for t in tickers}
+        for future in concurrent.futures.as_completed(futures):
+            df = future.result()
+            if not df.empty:
+                data_frames.append(df)
+                
+    if data_frames:
+        merged_data = data_frames[0]
+        for df in data_frames[1:]:
+            merged_data = merged_data.join(df, how='outer')
+        return merged_data.ffill().dropna()
+        
+    return pd.DataFrame()
 
 @st.cache_data(ttl=1800)
 def fetch_gold_predictions(ticker="GOLDIETF.NS"):
     """Calculates next-day High/Low execution triggers using 14-day Average True Range (ATR)."""
-    session = get_robust_session()
+    session = get_fast_session()
     try:
         url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?range=30d&interval=1d"
-        res = session.get(url, timeout=10)
+        res = session.get(url, timeout=5)
         if res.status_code == 200:
             quote = res.json()['chart']['result'][0]['indicators']['quote'][0]
             df = pd.DataFrame({
@@ -160,7 +178,6 @@ def fetch_gold_predictions(ticker="GOLDIETF.NS"):
                 'Close': quote['close']
             }).dropna()
             
-            # True Range Calculation
             df['prev_close'] = df['Close'].shift(1)
             df['tr1'] = df['High'] - df['Low']
             df['tr2'] = (df['High'] - df['prev_close']).abs()
@@ -170,7 +187,6 @@ def fetch_gold_predictions(ticker="GOLDIETF.NS"):
             atr_14 = df['TR'].rolling(14).mean().iloc[-1]
             last_close = df['Close'].iloc[-1]
             
-            # Predicting next day boundaries using +/- 1.5 ATR multiplier for breakout levels
             pred_high = last_close + (atr_14 * 1.5)
             pred_low = last_close - (atr_14 * 1.5)
             
@@ -181,7 +197,7 @@ def fetch_gold_predictions(ticker="GOLDIETF.NS"):
                 "pred_low": pred_low
             }
     except Exception as e:
-        print(f"ATR fetch failed: {e}")
+        pass
     return {"last_close": 0, "atr": 0, "pred_high": 0, "pred_low": 0}
 
 # ==========================================
@@ -193,7 +209,7 @@ index_choice = st.sidebar.selectbox("Select Target NSE Universe", ["nifty50", "n
 universe_tickers = fetch_nse_index_tickers(index_choice)
 
 with st.sidebar.expander("Equity Universe Selection", expanded=True):
-    st.info("💡 Background Queue Enabled: You can now process up to 500 stocks. The app will process them in chunks to prevent server timeouts.")
+    st.info("💡 Background Queue Enabled: You can now process up to 500 stocks without timeouts.")
     selected_tickers = st.multiselect("Select NSE Equities (Without .NS)", options=universe_tickers, default=universe_tickers[:10])
 
 with st.sidebar.expander("Composite Signal Weightings"):
@@ -233,14 +249,23 @@ def extract_screener_playwright(symbol, page):
 def process_symbol_chunk(symbols):
     """Processes a chunk of symbols for fundamentals and prices."""
     records = []
-    yf_syms = [f"{s}.NS" for s in symbols]
-    try:
-        price_df = yf.download(yf_syms, period="200d", session=get_robust_session(), progress=False)['Close']
-        if isinstance(price_df, pd.Series):
-            price_df = pd.DataFrame({yf_syms[0]: price_df})
-    except Exception:
-        price_df = pd.DataFrame()
+    session = get_fast_session()
+    
+    # 1. Fetch Prices for the chunk concurrently
+    end_date = datetime.today()
+    start_date = end_date - timedelta(days=200)
+    p1, p2 = int(start_date.timestamp()), int(end_date.timestamp())
+    
+    price_data = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(fetch_single_ticker, f"{s}.NS", p1, p2, session): s for s in symbols}
+        for future in concurrent.futures.as_completed(futures):
+            sym = futures[future]
+            df = future.result()
+            if not df.empty:
+                price_data[f"{sym}.NS"] = df[f"{sym}.NS"]
 
+    # 2. Fetch Fundamentals & Process Math
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -250,18 +275,27 @@ def process_symbol_chunk(symbols):
             for sym in symbols:
                 yf_sym = f"{sym}.NS"
                 try:
-                    info = yf.Ticker(yf_sym).info
-                    pe_yf = info.get("trailingPE", 0.0)
+                    # Quick Yahoo summary fetch
+                    info_url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{yf_sym}?modules=summaryDetail,defaultKeyStatistics"
+                    pe_yf, ev_ebitda_yf = 0.0, 0.0
+                    try:
+                        info_res = session.get(info_url, timeout=3)
+                        if info_res.status_code == 200:
+                            res_json = info_res.json().get('quoteSummary', {}).get('result', [{}])[0]
+                            pe_yf = res_json.get('summaryDetail', {}).get('trailingPE', {}).get('raw', 0.0)
+                            ev_ebitda_yf = res_json.get('defaultKeyStatistics', {}).get('enterpriseToEbitda', {}).get('raw', 0.0)
+                    except: pass
+                    
                     screener_data = extract_screener_playwright(sym, page)
                     
-                    px_data = price_df[yf_sym].dropna() if yf_sym in price_df.columns else pd.Series()
+                    px_data = price_data.get(yf_sym, pd.Series()).dropna()
                     hurst_val = compute_hurst(px_data) if len(px_data) > 40 else 0.5
                     tc_val = calibrate_lppls(px_data) if len(px_data) > 50 else 999.0
                     
                     records.append({
                         "Ticker": yf_sym,
                         "PE Ratio": screener_data.get("pe_ratio") or pe_yf,
-                        "EV/EBITDA": screener_data.get("ev_ebitda") or info.get("enterpriseToEbitda", 0.0),
+                        "EV/EBITDA": screener_data.get("ev_ebitda") or ev_ebitda_yf,
                         "ROCE (%)": screener_data.get("roce_pct", 0.0),
                         "Pledge (%)": screener_data.get("promoter_pledge_pct", 0.0),
                         "Hurst (100d)": hurst_val,
@@ -342,7 +376,7 @@ def fetch_sentiment_data() -> float:
 # ==========================================
 tab1, tab2, tab3 = st.tabs(["📊 Macro & Gold ETF Trading", "📈 Background Equity Ranker", "💰 Wealth Accumulation Sweep"])
 
-with st.spinner("Fetching Resilient Market Data..."):
+with st.spinner("Fetching Ultra-Fast Resilient Market Data..."):
     macro_df = fetch_macro_data(days=250)
     gold_preds = fetch_gold_predictions("GOLDIETF.NS")
 
