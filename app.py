@@ -79,35 +79,58 @@ def fetch_nse_index_tickers(index_name="nifty50"):
 
 @st.cache_data(ttl=3600)
 def fetch_prices_direct(tickers, days=200):
-    """Direct REST API fetch to bypass YFinance Rate Limiting on Streamlit Cloud."""
+    """Robust REST API fetch with multiple fallback endpoints."""
     end_date = datetime.today()
     start_date = end_date - timedelta(days=days)
     period1 = int(start_date.timestamp())
     period2 = int(end_date.timestamp())
     
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'application/json'
+    }
+    
     data = pd.DataFrame()
     
     for ticker in tickers:
-        try:
-            url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?period1={period1}&period2={period2}&interval=1d"
-            res = requests.get(url, headers=headers, timeout=10)
-            if res.status_code == 200:
-                json_data = res.json()
-                result = json_data.get('chart', {}).get('result', [])
-                if result:
-                    timestamps = result[0].get('timestamp', [])
-                    quote = result[0]['indicators']['quote'][0]
-                    closes = quote.get('close', [])
-                    
-                    valid_data = [(ts, c) for ts, c in zip(timestamps, closes) if c is not None]
-                    if valid_data:
-                        valid_ts, valid_closes = zip(*valid_data)
-                        dates = pd.to_datetime(valid_ts, unit='s').dt.date
-                        df = pd.DataFrame({ticker: valid_closes}, index=dates)
-                        data = df if data.empty else data.join(df, how='outer')
-        except Exception:
-            pass
+        success = False
+        endpoints = [
+            f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?period1={period1}&period2={period2}&interval=1d",
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?period1={period1}&period2={period2}&interval=1d",
+        ]
+        
+        for url in endpoints:
+            if success: break
+            try:
+                res = requests.get(url, headers=headers, timeout=10)
+                if res.status_code == 200:
+                    json_data = res.json()
+                    result = json_data.get('chart', {}).get('result', [])
+                    if result:
+                        timestamps = result[0].get('timestamp', [])
+                        quote = result[0]['indicators']['quote'][0]
+                        closes = quote.get('close', [])
+                        
+                        valid_data = [(ts, c) for ts, c in zip(timestamps, closes) if c is not None]
+                        if valid_data:
+                            valid_ts, valid_closes = zip(*valid_data)
+                            dates = pd.to_datetime(valid_ts, unit='s').dt.date
+                            df = pd.DataFrame({ticker: valid_closes}, index=dates)
+                            data = df if data.empty else data.join(df, how='outer')
+                            success = True
+            except Exception:
+                continue
+                
+        # Ultimate fallback: attempt standard yfinance download if direct endpoints fail
+        if not success:
+            try:
+                fallback_df = yf.download(ticker, start=start_date, end=end_date, progress=False)['Close']
+                if not fallback_df.empty:
+                    df = pd.DataFrame({ticker: fallback_df.values}, index=fallback_df.index.date)
+                    data = df if data.empty else data.join(df, how='outer')
+            except Exception:
+                pass
+                
     return data.ffill().dropna()
 
 # ==========================================
@@ -119,7 +142,7 @@ index_choice = st.sidebar.selectbox("Select Target NSE Universe", ["nifty50", "n
 universe_tickers = fetch_nse_index_tickers(index_choice)
 
 with st.sidebar.expander("Equity Universe Selection", expanded=True):
-    st.info("⚠️ Processing all 500 stocks live will timeout the cloud server. Please select a subset (10-20) to analyze.")
+    st.info("⚠️ Ensure you select a reasonable subset (10-20 stocks) to prevent cloud timeouts.")
     default_subset = universe_tickers[:7] if len(universe_tickers) >= 7 else universe_tickers
     selected_tickers = st.multiselect("Select NSE Equities (Without .NS)", options=universe_tickers, default=default_subset)
 
@@ -264,7 +287,6 @@ def fetch_sentiment_data() -> float:
 tab1, tab2, tab3 = st.tabs(["📊 Macro & Gold ETF Trading", "📈 Equity Power Law Ranker", "💰 Wealth Accumulation Sweep"])
 
 with st.spinner("Fetching Live Market Data..."):
-    # Target DXY, Crude, Nifty, Gold ETF
     macro_tickers = ["DX-Y.NYB", "BZ=F", "^NSEI", "GOLDIETF.NS"]
     macro_df = fetch_prices_direct(macro_tickers, days=250)
 
@@ -321,7 +343,18 @@ with tab1:
 # --- TAB 2: EQUITY RANKER ---
 with tab2:
     st.header(f"Power Law Criticality Ranker ({index_choice.upper()} Universe)")
-    if st.button("Execute Multi-Source Quant Analysis"):
+    
+    # Validation Check before allowing execution
+    if len(selected_tickers) > 20:
+        st.error(f"⚠️ You have selected {len(selected_tickers)} stocks. Processing more than 20 stocks at once will likely cause a Streamlit Cloud timeout. Please reduce your selection.")
+        execute_button = st.button("Execute Multi-Source Quant Analysis", disabled=True)
+    elif len(selected_tickers) == 0:
+        st.warning("⚠️ Please select at least one stock from the sidebar.")
+        execute_button = st.button("Execute Multi-Source Quant Analysis", disabled=True)
+    else:
+        execute_button = st.button("Execute Multi-Source Quant Analysis")
+        
+    if execute_button:
         with st.spinner("Scraping Fundamentals & Calibrating LPPLS Models..."):
             fund_df = fetch_multi_source_data(selected_tickers)
             
