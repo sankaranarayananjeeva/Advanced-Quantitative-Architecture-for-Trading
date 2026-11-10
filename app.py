@@ -13,8 +13,15 @@ import yfinance as yf
 from scipy.optimize import minimize
 from playwright.sync_api import sync_playwright
 
-# Streamlit Cloud Playwright Installation Hook
-os.system("playwright install chromium")
+# ==========================================
+# 0. Streamlit Cloud Playwright Installation
+# ==========================================
+@st.cache_resource
+def install_playwright():
+    """Installs Chromium only once per server boot to prevent boot timeouts."""
+    os.system("playwright install chromium")
+
+install_playwright()
 
 # ==========================================
 # 1. Page Configuration & Styling
@@ -160,6 +167,7 @@ def calculate_piotroski(ticker_obj):
 def fetch_multi_source_data(symbols):
     records = []
     with sync_playwright() as p:
+        # Running Headless since this is on a Cloud Server
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         page = context.new_page()
