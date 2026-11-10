@@ -6,3 +6,4 @@ plotly
 scipy
 playwright
 requests
+nest-asyncio
