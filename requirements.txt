@@ -7,3 +7,5 @@ scipy
 playwright
 requests
 nest-asyncio
+vaderSentiment
+feedparser
