@@ -5,6 +5,8 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import io
 import re
 import math
@@ -20,7 +22,6 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 # ==========================================
 # 0. Infrastructure & OS Patches
 # ==========================================
-# Patch Streamlit's event loop to allow synchronous Playwright execution
 nest_asyncio.apply()
 
 @st.cache_resource
@@ -53,84 +54,87 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("🏛️ Asymmetric Power Law & Macro Correlation Engine")
-st.markdown("Integrates Multi-Source Fundamentals, Macro DCC-GARCH Signals, Gold ETF Trading, and LPPLS Criticality.")
 
-# Session State for Sweep Ledger
+# ==========================================
+# Session State Initialization (For Background Queue)
+# ==========================================
 if 'portfolio_sweeps' not in st.session_state:
     st.session_state.portfolio_sweeps = pd.DataFrame(columns=['Date', 'Trade_Profit_INR', 'Sweep_Amount_INR', 'Gold_ETF_Price', 'Units_Accumulated'])
 if 'total_gold_units' not in st.session_state:
     st.session_state.total_gold_units = 0.0
 
+# Background Job Queue State
+if "bg_queue" not in st.session_state:
+    st.session_state.bg_queue = []
+if "bg_results" not in st.session_state:
+    st.session_state.bg_results = pd.DataFrame()
+if "is_processing" not in st.session_state:
+    st.session_state.is_processing = False
+if "total_to_process" not in st.session_state:
+    st.session_state.total_to_process = 0
+
 # ==========================================
-# 2. Market Data & API Bypasses
+# 2. Resilient Market Data Fetcher
 # ==========================================
+def get_robust_session():
+    """Creates a robust requests session with retries to bypass basic YF rate limits."""
+    session = requests.Session()
+    retry = Retry(connect=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'})
+    return session
+
 @st.cache_data(ttl=86400)
 def fetch_nse_index_tickers(index_name="nifty50"):
-    """Fetches real-time ticker lists directly from NSE Archives."""
     url = f"https://nsearchives.nseindia.com/content/indices/ind_{index_name}list.csv"
     try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        r = get_robust_session().get(url, timeout=10)
         if r.status_code == 200:
-            df = pd.read_csv(io.StringIO(r.text))
-            return df["Symbol"].tolist()
-    except Exception as e:
-        st.warning(f"NSE Fetch Failed: {e}")
-    return ["RECLTD", "PFC", "ZOMATO", "TATASTEEL", "ITC", "WIPRO", "ONGC"] # Fallback
+            return pd.read_csv(io.StringIO(r.text))["Symbol"].tolist()
+    except Exception:
+        pass
+    return ["RECLTD", "PFC", "ZOMATO", "TATASTEEL", "ITC", "WIPRO", "ONGC"] 
 
 @st.cache_data(ttl=3600)
-def fetch_prices_direct(tickers, days=200):
-    """Robust REST API fetch with multiple fallback endpoints."""
+def fetch_macro_data(days=250):
+    """Highly resilient macro fetcher."""
+    tickers = ["DX-Y.NYB", "BZ=F", "^NSEI", "GOLDIETF.NS"]
+    session = get_robust_session()
+    
+    try:
+        # 1st attempt: YF Download with custom session
+        df = yf.download(tickers, period=f"{days}d", session=session, progress=False)['Close']
+        if not df.empty and len(df) > 10:
+            return df.ffill().dropna()
+    except Exception as e:
+        print(f"YF primary fetch failed: {e}")
+        
+    # 2nd attempt: Direct REST endpoints if YF library gets blocked
     end_date = datetime.today()
     start_date = end_date - timedelta(days=days)
-    period1 = int(start_date.timestamp())
-    period2 = int(end_date.timestamp())
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept': 'application/json'
-    }
+    p1, p2 = int(start_date.timestamp()), int(end_date.timestamp())
     
     data = pd.DataFrame()
-    
-    for ticker in tickers:
-        success = False
-        endpoints = [
-            f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?period1={period1}&period2={period2}&interval=1d",
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?period1={period1}&period2={period2}&interval=1d",
-        ]
-        
-        for url in endpoints:
-            if success: break
-            try:
-                res = requests.get(url, headers=headers, timeout=10)
-                if res.status_code == 200:
-                    json_data = res.json()
-                    result = json_data.get('chart', {}).get('result', [])
-                    if result:
-                        timestamps = result[0].get('timestamp', [])
-                        quote = result[0]['indicators']['quote'][0]
-                        closes = quote.get('close', [])
-                        
-                        valid_data = [(ts, c) for ts, c in zip(timestamps, closes) if c is not None]
-                        if valid_data:
-                            valid_ts, valid_closes = zip(*valid_data)
-                            dates = pd.to_datetime(valid_ts, unit='s').dt.date
-                            df = pd.DataFrame({ticker: valid_closes}, index=dates)
-                            data = df if data.empty else data.join(df, how='outer')
-                            success = True
-            except Exception:
-                continue
-                
-        # Ultimate fallback: attempt standard yfinance download if direct endpoints fail
-        if not success:
-            try:
-                fallback_df = yf.download(ticker, start=start_date, end=end_date, progress=False)['Close']
-                if not fallback_df.empty:
-                    df = pd.DataFrame({ticker: fallback_df.values}, index=fallback_df.index.date)
-                    data = df if data.empty else data.join(df, how='outer')
-            except Exception:
-                pass
-                
+    for t in tickers:
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{t}?period1={p1}&period2={p2}&interval=1d"
+        try:
+            res = session.get(url, timeout=10)
+            if res.status_code == 200:
+                result = res.json().get('chart', {}).get('result', [])
+                if result:
+                    ts = result[0].get('timestamp', [])
+                    closes = result[0]['indicators']['quote'][0].get('close', [])
+                    valid_data = [(t_stamp, c) for t_stamp, c in zip(ts, closes) if c is not None]
+                    if valid_data:
+                        v_ts, v_c = zip(*valid_data)
+                        dates = pd.to_datetime(v_ts, unit='s').dt.date
+                        df_t = pd.DataFrame({t: v_c}, index=dates)
+                        data = df_t if data.empty else data.join(df_t, how='outer')
+        except Exception:
+            pass
+            
     return data.ffill().dropna()
 
 # ==========================================
@@ -142,9 +146,8 @@ index_choice = st.sidebar.selectbox("Select Target NSE Universe", ["nifty50", "n
 universe_tickers = fetch_nse_index_tickers(index_choice)
 
 with st.sidebar.expander("Equity Universe Selection", expanded=True):
-    st.info("⚠️ Ensure you select a reasonable subset (10-20 stocks) to prevent cloud timeouts.")
-    default_subset = universe_tickers[:7] if len(universe_tickers) >= 7 else universe_tickers
-    selected_tickers = st.multiselect("Select NSE Equities (Without .NS)", options=universe_tickers, default=default_subset)
+    st.info("💡 Background Queue Enabled: You can now process up to 500 stocks. The app will process them in chunks to prevent server timeouts.")
+    selected_tickers = st.multiselect("Select NSE Equities (Without .NS)", options=universe_tickers, default=universe_tickers[:10])
 
 with st.sidebar.expander("Composite Signal Weightings"):
     w_fund = st.sidebar.slider("Fundamental Anchor (%)", 0, 100, 40)
@@ -156,7 +159,7 @@ with st.sidebar.expander("Gold ETF Sweep Rules"):
     initial_capital = st.number_input("Initial Portfolio Capital (₹)", value=1000000, step=100000)
 
 # ==========================================
-# 4. Multi-Source Fundamental Extraction
+# 4. Power Law Math & Multi-Source Scraper
 # ==========================================
 def extract_screener_playwright(symbol, page):
     fallback_data = {"promoter_pledge_pct": 0.0}
@@ -175,52 +178,61 @@ def extract_screener_playwright(symbol, page):
         fallback_data["roce_pct"] = extract_metric(r"ROCE", html)
         fallback_data["ev_ebitda"] = extract_metric(r"EV / EBITDA", html)
         
-        current_price = extract_metric(r"Current Price", html)
-        book_value = extract_metric(r"Book Value", html)
-        if current_price and book_value and book_value != 0:
-            fallback_data["pb_ratio"] = round(current_price / book_value, 2)
-
         match_top = re.search(r'Pledged percentage.*?<span class="number">([^<]+)</span>', html, re.DOTALL | re.IGNORECASE)
         if match_top: fallback_data["promoter_pledge_pct"] = float(match_top.group(1).replace(",", "").strip())
     except Exception: pass
     return fallback_data
 
-@st.cache_data(ttl=3600)
-def fetch_multi_source_data(symbols):
+def process_symbol_chunk(symbols):
+    """Processes a chunk of symbols for fundamentals and prices."""
     records = []
+    
+    # 1. Fetch Prices for the chunk
+    yf_syms = [f"{s}.NS" for s in symbols]
+    try:
+        price_df = yf.download(yf_syms, period="200d", session=get_robust_session(), progress=False)['Close']
+        if isinstance(price_df, pd.Series):
+            price_df = pd.DataFrame({yf_syms[0]: price_df})
+    except Exception:
+        price_df = pd.DataFrame()
+
+    # 2. Fetch Fundamentals & Process Math
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            context = browser.new_context(user_agent="Mozilla/5.0")
             page = context.new_page()
 
             for sym in symbols:
                 yf_sym = f"{sym}.NS"
-                info = yf.Ticker(yf_sym).info
-                pe_yf = info.get("trailingPE", 0.0)
-                pb_yf = info.get("priceToBook", 0.0)
-                screener_data = extract_screener_playwright(sym, page)
-                
-                records.append({
-                    "Ticker": yf_sym,
-                    "PE Ratio": screener_data.get("pe_ratio") or pe_yf,
-                    "PB Ratio": screener_data.get("pb_ratio") or pb_yf,
-                    "EV/EBITDA": screener_data.get("ev_ebitda") or info.get("enterpriseToEbitda", 0.0),
-                    "ROCE (%)": screener_data.get("roce_pct", 0.0),
-                    "Pledge (%)": screener_data.get("promoter_pledge_pct", 0.0)
-                })
+                try:
+                    info = yf.Ticker(yf_sym).info
+                    pe_yf = info.get("trailingPE", 0.0)
+                    screener_data = extract_screener_playwright(sym, page)
+                    
+                    # Prices & Math
+                    px_data = price_df[yf_sym].dropna() if yf_sym in price_df.columns else pd.Series()
+                    hurst_val = compute_hurst(px_data) if len(px_data) > 40 else 0.5
+                    tc_val = calibrate_lppls(px_data) if len(px_data) > 50 else 999.0
+                    
+                    records.append({
+                        "Ticker": yf_sym,
+                        "PE Ratio": screener_data.get("pe_ratio") or pe_yf,
+                        "EV/EBITDA": screener_data.get("ev_ebitda") or info.get("enterpriseToEbitda", 0.0),
+                        "ROCE (%)": screener_data.get("roce_pct", 0.0),
+                        "Pledge (%)": screener_data.get("promoter_pledge_pct", 0.0),
+                        "Hurst (100d)": hurst_val,
+                        "LPPLS t_c (days)": tc_val
+                    })
+                except Exception as e:
+                    print(f"Error processing {sym}: {e}")
             browser.close()
     except Exception as e:
-        st.warning(f"Playwright scraping degraded. Using Yahoo. Error: {e}")
-        for sym in symbols:
-            records.append({"Ticker": f"{sym}.NS", "PE Ratio": 0, "PB Ratio": 0, "EV/EBITDA": 0, "ROCE (%)": 0, "Pledge (%)": 0})
+        print(f"Playwright error in chunk: {e}")
+        
     return pd.DataFrame(records)
 
-# ==========================================
-# 5. Power Law Math (Hurst & LPPLS)
-# ==========================================
 def compute_hurst(prices, window=100):
-    prices = prices.dropna()
     if len(prices) < 40: return 0.5
     log_returns = np.diff(np.log(prices.values))
     if len(log_returns) > window: log_returns = log_returns[-window:]
@@ -246,9 +258,7 @@ def compute_hurst(prices, window=100):
     return float(np.clip(slope, 0.0, 1.0))
 
 def calibrate_lppls(prices, window=120):
-    clean_prices = prices.dropna()
-    if len(clean_prices) < 50: return 999.0
-    series = clean_prices.iloc[-min(window, len(clean_prices)):]
+    series = prices.iloc[-min(window, len(prices)):]
     y, t = np.log(series.values), np.arange(len(series), dtype=float)
     t_last = float(len(y) - 1)
 
@@ -276,28 +286,31 @@ def compute_zscore(series, invert=False):
 
 @st.cache_data(ttl=1800)
 def fetch_sentiment_data() -> float:
-    rss_urls = ["https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000811", "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"]
-    analyzer = SentimentIntensityAnalyzer()
-    scores = [analyzer.polarity_scores(entry.title)['compound'] for url in rss_urls for entry in feedparser.parse(url).entries[:15]]
-    return round(np.mean(scores), 3) if scores else 0.0
+    try:
+        rss_urls = ["https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000811", "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"]
+        analyzer = SentimentIntensityAnalyzer()
+        scores = [analyzer.polarity_scores(entry.title)['compound'] for url in rss_urls for entry in feedparser.parse(url).entries[:15]]
+        return round(np.mean(scores), 3) if scores else 0.0
+    except Exception:
+        return 0.0
 
 # ==========================================
-# 6. Execution & UI Rendering
+# 5. UI Rendering & Background Queue Processor
 # ==========================================
-tab1, tab2, tab3 = st.tabs(["📊 Macro & Gold ETF Trading", "📈 Equity Power Law Ranker", "💰 Wealth Accumulation Sweep"])
+tab1, tab2, tab3 = st.tabs(["📊 Macro & Gold ETF Trading", "📈 Background Equity Ranker", "💰 Wealth Accumulation Sweep"])
 
-with st.spinner("Fetching Live Market Data..."):
-    macro_tickers = ["DX-Y.NYB", "BZ=F", "^NSEI", "GOLDIETF.NS"]
-    macro_df = fetch_prices_direct(macro_tickers, days=250)
+with st.spinner("Fetching Resilient Market Data..."):
+    macro_df = fetch_macro_data(days=250)
 
 # --- TAB 1: MACRO & GOLD ---
 with tab1:
     st.header("Macroeconomic Environment & Gold ETF Trading")
-    if not macro_df.empty and len(macro_df) > 20:
+    
+    if not macro_df.empty and 'GOLDIETF.NS' in macro_df.columns:
         colA, colB, colC, colD = st.columns(4)
-        gold_px = macro_df['GOLDIETF.NS'].iloc[-1] if 'GOLDIETF.NS' in macro_df else 0.0
-        gold_hurst = compute_hurst(macro_df['GOLDIETF.NS']) if 'GOLDIETF.NS' in macro_df else 0.5
-        gold_tc = calibrate_lppls(macro_df['GOLDIETF.NS']) if 'GOLDIETF.NS' in macro_df else 999.0
+        gold_px = macro_df['GOLDIETF.NS'].iloc[-1]
+        gold_hurst = compute_hurst(macro_df['GOLDIETF.NS'])
+        gold_tc = calibrate_lppls(macro_df['GOLDIETF.NS'])
         sentiment = fetch_sentiment_data()
         
         colA.metric("ICICI Gold ETF (GOLDIETF.NS)", f"₹{gold_px:,.2f}")
@@ -308,19 +321,18 @@ with tab1:
         st.markdown("---")
         c1, c2 = st.columns([1, 2])
         with c1:
-            try:
-                dxy_trend = macro_df['DX-Y.NYB'].iloc[-1] - macro_df['DX-Y.NYB'].iloc[-20]
-                crude_trend = macro_df['BZ=F'].iloc[-1] - macro_df['BZ=F'].iloc[-20]
-                nifty_trend = macro_df['^NSEI'].iloc[-1] - macro_df['^NSEI'].iloc[-20]
+            # Defensive Macro Trend calculation
+            dxy_trend, crude_trend, nifty_trend = 0, 0, 0
+            if 'DX-Y.NYB' in macro_df.columns and len(macro_df) > 20: dxy_trend = macro_df['DX-Y.NYB'].iloc[-1] - macro_df['DX-Y.NYB'].iloc[-20]
+            if 'BZ=F' in macro_df.columns and len(macro_df) > 20: crude_trend = macro_df['BZ=F'].iloc[-1] - macro_df['BZ=F'].iloc[-20]
+            if '^NSEI' in macro_df.columns and len(macro_df) > 20: nifty_trend = macro_df['^NSEI'].iloc[-1] - macro_df['^NSEI'].iloc[-20]
                 
-                if dxy_trend > 0 and crude_trend > 0 and nifty_trend < 0:
-                    macro_signal, macro_multiplier, css_class = "STRONG RISK-OFF (Gold Favorable)", 0.50, "macro-off"
-                elif dxy_trend < 0 and crude_trend < 0 and nifty_trend > 0:
-                    macro_signal, macro_multiplier, css_class = "STRONG RISK-ON (Equity Favorable)", 1.25, "macro-on"
-                else:
-                    macro_signal, macro_multiplier, css_class = "NEUTRAL", 1.00, "macro-neutral"
-            except Exception:
-                macro_signal, macro_multiplier, css_class = "NEUTRAL (DATA PENDING)", 1.00, "macro-neutral"
+            if dxy_trend > 0 and crude_trend > 0 and nifty_trend < 0:
+                macro_signal, macro_multiplier, css_class = "STRONG RISK-OFF (Gold Favorable)", 0.50, "macro-off"
+            elif dxy_trend < 0 and crude_trend < 0 and nifty_trend > 0:
+                macro_signal, macro_multiplier, css_class = "STRONG RISK-ON (Equity Favorable)", 1.25, "macro-on"
+            else:
+                macro_signal, macro_multiplier, css_class = "NEUTRAL", 1.00, "macro-neutral"
                 
             st.markdown(f"""
             <div data-testid="metric-container" class="{css_class}">
@@ -331,61 +343,91 @@ with tab1:
             """, unsafe_allow_html=True)
             
         with c2:
-            st.write("**Cross-Asset Conditional Correlation Matrix (Trailing 60 Days)**")
-            corr_matrix = macro_df.tail(60).pct_change().corr()
-            fig_corr = px.imshow(corr_matrix, text_auto=".2f", aspect="auto", color_continuous_scale="RdBu_r")
-            fig_corr.update_layout(margin=dict(l=20, r=20, t=20, b=20), paper_bgcolor="rgba(0,0,0,0)")
-            st.plotly_chart(fig_corr, use_container_width=True)
+            if len(macro_df) > 60:
+                st.write("**Cross-Asset Conditional Correlation Matrix (Trailing 60 Days)**")
+                corr_matrix = macro_df.tail(60).pct_change().corr()
+                fig_corr = px.imshow(corr_matrix, text_auto=".2f", aspect="auto", color_continuous_scale="RdBu_r")
+                fig_corr.update_layout(margin=dict(l=20, r=20, t=20, b=20), paper_bgcolor="rgba(0,0,0,0)")
+                st.plotly_chart(fig_corr, use_container_width=True)
     else:
-        st.error("Insufficient macroeconomic data retrieved. API may be rate-limited.")
+        st.warning("⚠️ Macroeconomic data degraded. YFinance APIs may be experiencing heavy rate-limiting. Using Neutral fallback multipliers.")
         macro_multiplier, gold_px = 1.0, 0.0
 
-# --- TAB 2: EQUITY RANKER ---
+
+# --- TAB 2: BACKGROUND EQUITY RANKER ---
 with tab2:
-    st.header(f"Power Law Criticality Ranker ({index_choice.upper()} Universe)")
+    st.header(f"Background Power Law Ranker ({index_choice.upper()} Universe)")
+    st.write("This engine uses an iterative background queue to process hundreds of stocks without timing out the server. It fetches data in chunks of 5.")
     
-    # Validation Check before allowing execution
-    if len(selected_tickers) > 20:
-        st.error(f"⚠️ You have selected {len(selected_tickers)} stocks. Processing more than 20 stocks at once will likely cause a Streamlit Cloud timeout. Please reduce your selection.")
-        execute_button = st.button("Execute Multi-Source Quant Analysis", disabled=True)
-    elif len(selected_tickers) == 0:
-        st.warning("⚠️ Please select at least one stock from the sidebar.")
-        execute_button = st.button("Execute Multi-Source Quant Analysis", disabled=True)
-    else:
-        execute_button = st.button("Execute Multi-Source Quant Analysis")
-        
-    if execute_button:
-        with st.spinner("Scraping Fundamentals & Calibrating LPPLS Models..."):
-            fund_df = fetch_multi_source_data(selected_tickers)
+    # 1. Start Processing Button
+    col_btn, col_prog = st.columns([1, 3])
+    with col_btn:
+        if st.button("Start Background Execution", disabled=st.session_state.is_processing):
+            if len(selected_tickers) > 0:
+                st.session_state.bg_queue = selected_tickers.copy()
+                st.session_state.total_to_process = len(selected_tickers)
+                st.session_state.bg_results = pd.DataFrame()
+                st.session_state.is_processing = True
+                st.rerun()
+            else:
+                st.error("Please select at least 1 ticker.")
+    
+    with col_prog:
+        if st.button("Stop/Clear Queue"):
+            st.session_state.is_processing = False
+            st.session_state.bg_queue = []
+            st.rerun()
+
+    # 2. Iterative Chunk Processor (The "Background" Loop via st.rerun)
+    if st.session_state.is_processing:
+        if len(st.session_state.bg_queue) > 0:
+            # Pop 5 items from the queue
+            chunk = st.session_state.bg_queue[:5]
+            st.session_state.bg_queue = st.session_state.bg_queue[5:]
             
-            try:
-                price_df = fetch_prices_direct([f"{s}.NS" for s in selected_tickers], days=250)
+            # Progress UI
+            processed_count = st.session_state.total_to_process - len(st.session_state.bg_queue)
+            progress_pct = processed_count / st.session_state.total_to_process
+            st.progress(progress_pct, text=f"Processing Chunk: {chunk} ({processed_count}/{st.session_state.total_to_process})")
+            
+            # Execute Chunk
+            chunk_df = process_symbol_chunk(chunk)
+            
+            if not chunk_df.empty:
+                st.session_state.bg_results = pd.concat([st.session_state.bg_results, chunk_df], ignore_index=True)
                 
-                fund_df["Hurst (100d)"] = fund_df["Ticker"].apply(lambda t: compute_hurst(price_df[t]) if t in price_df.columns else 0.5)
-                fund_df["LPPLS t_c (days)"] = fund_df["Ticker"].apply(lambda t: calibrate_lppls(price_df[t]) if t in price_df.columns else 999.0)
-                
-                fund_df["Z_Fund"] = compute_zscore(fund_df["ROCE (%)"]) + compute_zscore(fund_df["EV/EBITDA"], invert=True)
-                fund_df["Z_PLCS"] = compute_zscore(fund_df["Hurst (100d)"]) + compute_zscore(fund_df["LPPLS t_c (days)"], invert=True)
-                
-                fund_df["Composite Score"] = ((w_fund/100) * fund_df["Z_Fund"] + (w_plcs/100) * fund_df["Z_PLCS"]) * macro_multiplier
-                fund_df["Liquidation Alert"] = np.where((fund_df["LPPLS t_c (days)"] <= 30) & (fund_df["Hurst (100d)"] <= 0.55), True, False)
-                
-                st.dataframe(
-                    fund_df.sort_values(by="Composite Score", ascending=False),
-                    column_config={
-                        "Hurst (100d)": st.column_config.NumberColumn(format="%.3f"),
-                        "LPPLS t_c (days)": st.column_config.NumberColumn(format="%.1f"),
-                        "Composite Score": st.column_config.NumberColumn(format="%.3f"),
-                    },
-                    use_container_width=True, hide_index=True
-                )
-            except Exception as e:
-                st.error(f"Failed to process Power Law ranking due to pricing data error: {e}")
+            time.sleep(1) # Brief pause to yield to network limits
+            st.rerun() # Re-trigger script to process next chunk and keep HTTP request alive
+            
+        else:
+            # Queue Empty -> Done
+            st.session_state.is_processing = False
+            st.success("Background Execution Complete!")
+
+    # 3. Final Results Rendering
+    if not st.session_state.bg_results.empty:
+        fund_df = st.session_state.bg_results.copy()
+        
+        # Calculate Final Z-Scores on the aggregate dataset
+        fund_df["Z_Fund"] = compute_zscore(fund_df["ROCE (%)"]) + compute_zscore(fund_df["EV/EBITDA"], invert=True)
+        fund_df["Z_PLCS"] = compute_zscore(fund_df["Hurst (100d)"]) + compute_zscore(fund_df["LPPLS t_c (days)"], invert=True)
+        fund_df["Composite Score"] = ((w_fund/100) * fund_df["Z_Fund"] + (w_plcs/100) * fund_df["Z_PLCS"]) * macro_multiplier
+        fund_df["Liquidation Alert"] = np.where((fund_df["LPPLS t_c (days)"] <= 30) & (fund_df["Hurst (100d)"] <= 0.55), True, False)
+        
+        st.write(f"### Final Computed Rankings ({len(fund_df)} Stocks Analyzed)")
+        st.dataframe(
+            fund_df.sort_values(by="Composite Score", ascending=False),
+            column_config={
+                "Hurst (100d)": st.column_config.NumberColumn(format="%.3f"),
+                "LPPLS t_c (days)": st.column_config.NumberColumn(format="%.1f"),
+                "Composite Score": st.column_config.NumberColumn(format="%.3f"),
+            },
+            use_container_width=True, hide_index=True
+        )
 
 # --- TAB 3: SWEEP CALCULATOR ---
 with tab3:
     st.header("Systematic Wealth Accumulation: ICICI Gold ETF Sweep Protocol")
-    st.markdown(f"**Current Execution Directive:** Sweep **{profit_sweep_pct}%** of realized short-term equity trading profits directly into physical Gold ETF accumulation to convert active alpha into inflation-hedged beta.")
     
     with st.form("sweep_form", clear_on_submit=True):
         trade_profit = st.number_input("Realized Profit from Closed Equity Trade (INR)", min_value=0.0, step=1000.0)
