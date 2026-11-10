@@ -50,6 +50,15 @@ st.markdown("""
     .macro-on { border-left: 5px solid #00cc66 !important; }
     .macro-off { border-left: 5px solid #ff3333 !important; }
     .macro-neutral { border-left: 5px solid #ffcc00 !important; }
+    .pred-box {
+        background-color: #2b2b2b;
+        border: 1px solid #444;
+        padding: 15px;
+        border-radius: 5px;
+        text-align: center;
+    }
+    .pred-high { color: #00cc66; font-size: 24px; font-weight: bold; }
+    .pred-low { color: #ff3333; font-size: 24px; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -100,18 +109,17 @@ def fetch_nse_index_tickers(index_name="nifty50"):
 @st.cache_data(ttl=3600)
 def fetch_macro_data(days=250):
     """Highly resilient macro fetcher."""
-    tickers = ["DX-Y.NYB", "BZ=F", "^NSEI", "GOLDIETF.NS"]
+    # Included Major Currencies: USD/INR, EUR/USD, GBP/USD, USD/JPY
+    tickers = ["DX-Y.NYB", "BZ=F", "^NSEI", "GOLDIETF.NS", "INR=X", "EURUSD=X", "GBPUSD=X", "JPY=X"]
     session = get_robust_session()
     
     try:
-        # 1st attempt: YF Download with custom session
         df = yf.download(tickers, period=f"{days}d", session=session, progress=False)['Close']
         if not df.empty and len(df) > 10:
             return df.ffill().dropna()
     except Exception as e:
         print(f"YF primary fetch failed: {e}")
         
-    # 2nd attempt: Direct REST endpoints if YF library gets blocked
     end_date = datetime.today()
     start_date = end_date - timedelta(days=days)
     p1, p2 = int(start_date.timestamp()), int(end_date.timestamp())
@@ -136,6 +144,45 @@ def fetch_macro_data(days=250):
             pass
             
     return data.ffill().dropna()
+
+@st.cache_data(ttl=1800)
+def fetch_gold_predictions(ticker="GOLDIETF.NS"):
+    """Calculates next-day High/Low execution triggers using 14-day Average True Range (ATR)."""
+    session = get_robust_session()
+    try:
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?range=30d&interval=1d"
+        res = session.get(url, timeout=10)
+        if res.status_code == 200:
+            quote = res.json()['chart']['result'][0]['indicators']['quote'][0]
+            df = pd.DataFrame({
+                'High': quote['high'], 
+                'Low': quote['low'], 
+                'Close': quote['close']
+            }).dropna()
+            
+            # True Range Calculation
+            df['prev_close'] = df['Close'].shift(1)
+            df['tr1'] = df['High'] - df['Low']
+            df['tr2'] = (df['High'] - df['prev_close']).abs()
+            df['tr3'] = (df['Low'] - df['prev_close']).abs()
+            df['TR'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+            
+            atr_14 = df['TR'].rolling(14).mean().iloc[-1]
+            last_close = df['Close'].iloc[-1]
+            
+            # Predicting next day boundaries using +/- 1.5 ATR multiplier for breakout levels
+            pred_high = last_close + (atr_14 * 1.5)
+            pred_low = last_close - (atr_14 * 1.5)
+            
+            return {
+                "last_close": last_close,
+                "atr": atr_14,
+                "pred_high": pred_high,
+                "pred_low": pred_low
+            }
+    except Exception as e:
+        print(f"ATR fetch failed: {e}")
+    return {"last_close": 0, "atr": 0, "pred_high": 0, "pred_low": 0}
 
 # ==========================================
 # 3. Sidebar Configuration
@@ -186,8 +233,6 @@ def extract_screener_playwright(symbol, page):
 def process_symbol_chunk(symbols):
     """Processes a chunk of symbols for fundamentals and prices."""
     records = []
-    
-    # 1. Fetch Prices for the chunk
     yf_syms = [f"{s}.NS" for s in symbols]
     try:
         price_df = yf.download(yf_syms, period="200d", session=get_robust_session(), progress=False)['Close']
@@ -196,7 +241,6 @@ def process_symbol_chunk(symbols):
     except Exception:
         price_df = pd.DataFrame()
 
-    # 2. Fetch Fundamentals & Process Math
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -210,7 +254,6 @@ def process_symbol_chunk(symbols):
                     pe_yf = info.get("trailingPE", 0.0)
                     screener_data = extract_screener_playwright(sym, page)
                     
-                    # Prices & Math
                     px_data = price_df[yf_sym].dropna() if yf_sym in price_df.columns else pd.Series()
                     hurst_val = compute_hurst(px_data) if len(px_data) > 40 else 0.5
                     tc_val = calibrate_lppls(px_data) if len(px_data) > 50 else 999.0
@@ -301,10 +344,11 @@ tab1, tab2, tab3 = st.tabs(["📊 Macro & Gold ETF Trading", "📈 Background Eq
 
 with st.spinner("Fetching Resilient Market Data..."):
     macro_df = fetch_macro_data(days=250)
+    gold_preds = fetch_gold_predictions("GOLDIETF.NS")
 
 # --- TAB 1: MACRO & GOLD ---
 with tab1:
-    st.header("Macroeconomic Environment & Gold ETF Trading")
+    st.header("Macroeconomic Environment & Gold ETF Execution")
     
     if not macro_df.empty and 'GOLDIETF.NS' in macro_df.columns:
         colA, colB, colC, colD = st.columns(4)
@@ -318,10 +362,31 @@ with tab1:
         colC.metric("LPPLS Criticality", f"{round(gold_tc,1)} days", delta="LIQUIDATION WARNING" if gold_tc <= 30 else "Safe", delta_color="inverse" if gold_tc<=30 else "normal")
         colD.metric("Macro NLP Sentiment", sentiment, delta="Bullish" if sentiment > 0.05 else "Bearish" if sentiment < -0.05 else "Neutral")
 
+        # Predictive Execution Box
+        if gold_preds["pred_high"] > 0:
+            st.markdown(f"""
+            <div class="pred-box">
+                <p style="margin:0; color:#aaa; font-size:14px;">Next Session ETF Execution Bounds (14-Day ATR Implied)</p>
+                <div style="display:flex; justify-content:space-around; align-items:center; margin-top:10px;">
+                    <div>
+                        <span style="color:#aaa; font-size:14px;">Expected Low Entry</span><br>
+                        <span class="pred-low">₹{gold_preds['pred_low']:.2f}</span>
+                    </div>
+                    <div>
+                        <span style="color:#888; font-size:12px;">Current Volatility (ATR): ₹{gold_preds['atr']:.2f}</span>
+                    </div>
+                    <div>
+                        <span style="color:#aaa; font-size:14px;">Expected High Target</span><br>
+                        <span class="pred-high">₹{gold_preds['pred_high']:.2f}</span>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.write("")
+
         st.markdown("---")
         c1, c2 = st.columns([1, 2])
         with c1:
-            # Defensive Macro Trend calculation
             dxy_trend, crude_trend, nifty_trend = 0, 0, 0
             if 'DX-Y.NYB' in macro_df.columns and len(macro_df) > 20: dxy_trend = macro_df['DX-Y.NYB'].iloc[-1] - macro_df['DX-Y.NYB'].iloc[-20]
             if 'BZ=F' in macro_df.columns and len(macro_df) > 20: crude_trend = macro_df['BZ=F'].iloc[-1] - macro_df['BZ=F'].iloc[-20]
@@ -339,12 +404,12 @@ with tab1:
                 <p style="font-size:14px; color:#888; margin-bottom:0;">Macro Regime Classification</p>
                 <h2 style="margin:0; padding:0;">{macro_signal}</h2>
                 <p style="color:#aaa; font-size:12px; margin-top:5px;">Equity PLCS Multiplier: {macro_multiplier}x</p>
-            </div><br>
+            </div>
             """, unsafe_allow_html=True)
             
         with c2:
             if len(macro_df) > 60:
-                st.write("**Cross-Asset Conditional Correlation Matrix (Trailing 60 Days)**")
+                st.write("**Cross-Asset Correlation Matrix (Inc. Major Currencies)**")
                 corr_matrix = macro_df.tail(60).pct_change().corr()
                 fig_corr = px.imshow(corr_matrix, text_auto=".2f", aspect="auto", color_continuous_scale="RdBu_r")
                 fig_corr.update_layout(margin=dict(l=20, r=20, t=20, b=20), paper_bgcolor="rgba(0,0,0,0)")
@@ -353,13 +418,11 @@ with tab1:
         st.warning("⚠️ Macroeconomic data degraded. YFinance APIs may be experiencing heavy rate-limiting. Using Neutral fallback multipliers.")
         macro_multiplier, gold_px = 1.0, 0.0
 
-
 # --- TAB 2: BACKGROUND EQUITY RANKER ---
 with tab2:
     st.header(f"Background Power Law Ranker ({index_choice.upper()} Universe)")
     st.write("This engine uses an iterative background queue to process hundreds of stocks without timing out the server. It fetches data in chunks of 5.")
     
-    # 1. Start Processing Button
     col_btn, col_prog = st.columns([1, 3])
     with col_btn:
         if st.button("Start Background Execution", disabled=st.session_state.is_processing):
@@ -378,37 +441,30 @@ with tab2:
             st.session_state.bg_queue = []
             st.rerun()
 
-    # 2. Iterative Chunk Processor (The "Background" Loop via st.rerun)
     if st.session_state.is_processing:
         if len(st.session_state.bg_queue) > 0:
-            # Pop 5 items from the queue
             chunk = st.session_state.bg_queue[:5]
             st.session_state.bg_queue = st.session_state.bg_queue[5:]
             
-            # Progress UI
             processed_count = st.session_state.total_to_process - len(st.session_state.bg_queue)
             progress_pct = processed_count / st.session_state.total_to_process
             st.progress(progress_pct, text=f"Processing Chunk: {chunk} ({processed_count}/{st.session_state.total_to_process})")
             
-            # Execute Chunk
             chunk_df = process_symbol_chunk(chunk)
             
             if not chunk_df.empty:
                 st.session_state.bg_results = pd.concat([st.session_state.bg_results, chunk_df], ignore_index=True)
                 
-            time.sleep(1) # Brief pause to yield to network limits
-            st.rerun() # Re-trigger script to process next chunk and keep HTTP request alive
+            time.sleep(1)
+            st.rerun()
             
         else:
-            # Queue Empty -> Done
             st.session_state.is_processing = False
             st.success("Background Execution Complete!")
 
-    # 3. Final Results Rendering
     if not st.session_state.bg_results.empty:
         fund_df = st.session_state.bg_results.copy()
         
-        # Calculate Final Z-Scores on the aggregate dataset
         fund_df["Z_Fund"] = compute_zscore(fund_df["ROCE (%)"]) + compute_zscore(fund_df["EV/EBITDA"], invert=True)
         fund_df["Z_PLCS"] = compute_zscore(fund_df["Hurst (100d)"]) + compute_zscore(fund_df["LPPLS t_c (days)"], invert=True)
         fund_df["Composite Score"] = ((w_fund/100) * fund_df["Z_Fund"] + (w_plcs/100) * fund_df["Z_PLCS"]) * macro_multiplier
