@@ -90,7 +90,13 @@ if "total_to_process" not in st.session_state:
 # ==========================================
 def get_fast_session():
     session = requests.Session()
-    retry = Retry(connect=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    # Explicit Exponential Backoff Configuration for 429 Errors
+    retry = Retry(
+        connect=4, 
+        backoff_factor=1.5, 
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
     adapter = HTTPAdapter(max_retries=retry)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
@@ -111,14 +117,18 @@ def fetch_nse_index_tickers(index_name="nifty50"):
     return ["RECLTD", "PFC", "ZOMATO", "TATASTEEL", "ITC", "WIPRO", "ONGC"] 
 
 def fetch_single_ticker_with_retry(ticker, p1, p2, session):
+    """
+    Robust fetcher with explicit rate-limit (429) backoff handling and
+    endpoint rotation to ensure successful fetches on free-tier cloud IPs.
+    """
     endpoints = [
         f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?period1={p1}&period2={p2}&interval=1d",
         f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?period1={p1}&period2={p2}&interval=1d"
     ]
-    for attempt in range(2):
+    for attempt in range(3):
         for url in endpoints:
             try:
-                res = session.get(url, timeout=4)
+                res = session.get(url, timeout=5)
                 if res.status_code == 200:
                     result = res.json().get('chart', {}).get('result', [])
                     if result:
@@ -131,15 +141,15 @@ def fetch_single_ticker_with_retry(ticker, p1, p2, session):
                             v_ts, v_o, v_h, v_l, v_c = zip(*valid_data)
                             dates = pd.to_datetime(v_ts, unit='s').dt.date
                             return pd.DataFrame({'Open': v_o, 'High': v_h, 'Low': v_l, 'Close': v_c}, index=dates)
-                elif res.status_code == 429:
-                    time.sleep(2 ** attempt) # Exponential backoff
+                elif res.status_code == 429: # Explicitly catch and sleep for rate limits
+                    time.sleep(2 ** attempt)
             except Exception:
                 continue
     return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
 def fetch_macro_data(days=250):
-    """Sequential fetching to respect Yahoo rate limits and extract OHLC."""
+    """Sequential fetching with programmatic sleep to bypass Yahoo rate limits."""
     tickers = ["DX-Y.NYB", "BZ=F", "^NSEI", "GOLDIETF.NS", "INR=X", "EURUSD=X", "GBPUSD=X", "JPY=X", "GC=F"]
     session = get_fast_session()
     
@@ -155,7 +165,8 @@ def fetch_macro_data(days=250):
         if not df.empty:
             macro_close_dict[t] = df['Close']
             ohlc_dict[t] = df
-        time.sleep(0.3) # Sequential breather to prevent 429 tarpit
+        # Explicit Throttle: Ensures we never trigger Yahoo's concurrent connection tarpit
+        time.sleep(1.0)
                 
     if macro_close_dict:
         merged_close = pd.DataFrame(macro_close_dict).ffill().dropna()
@@ -172,21 +183,31 @@ def calculate_advanced_gold_bounds(macro_df, ohlc_dict):
 
     # 1. Garman-Klass Volatility Calculation
     gold_df = ohlc_dict['GOLDIETF.NS'].tail(30).copy()
+    
+    # Handle cases where High/Low/Open might be missing or zero to prevent log(0)
+    gold_df = gold_df[(gold_df['High'] > 0) & (gold_df['Low'] > 0) & (gold_df['Open'] > 0) & (gold_df['Close'] > 0)]
+    
+    if len(gold_df) < 14:
+        return None
+        
     gold_df['log_hl'] = np.log(gold_df['High'] / gold_df['Low'])
     gold_df['log_co'] = np.log(gold_df['Close'] / gold_df['Open'])
     
     # GK Formula: 0.5 * (ln(H/L))^2 - (2*ln(2)-1) * (ln(C/O))^2
     gold_df['gk_var'] = 0.5 * (gold_df['log_hl'] ** 2) - (2 * np.log(2) - 1) * (gold_df['log_co'] ** 2)
+    
+    # Ensure variance is positive before square root
+    gold_df['gk_var'] = gold_df['gk_var'].clip(lower=0.000001)
+    
     # 14-day smoothing for stable daily volatility estimate
     gk_daily_vol = np.sqrt(gold_df['gk_var'].rolling(14).mean().iloc[-1])
     
     # 2. Error Correction / Cointegration Spread Model (VECM Proxy)
-    # Compare Domestic Gold (GOLDIETF) to Theoretical Value (Global Gold * USDINR)
     recent_macro = macro_df.tail(60).copy()
     y = np.log(recent_macro['GOLDIETF.NS'].values)
     
-    # Theoretical international proxy value
-    theoretical_int = (recent_macro['GC=F'].values / 31.1035) * recent_macro['INR=X'].values
+    # Theoretical international proxy value (GC=F is per troy ounce, 1 troy oz = 31.1034768 grams)
+    theoretical_int = (recent_macro['GC=F'].values / 31.1034768) * recent_macro['INR=X'].values
     x = np.log(theoretical_int)
     
     # OLS Regression
@@ -201,12 +222,10 @@ def calculate_advanced_gold_bounds(macro_df, ohlc_dict):
     z_spread = (current_spread - spread_mean) / spread_std if spread_std > 0 else 0
     
     # Error Correction Bias Formulation
-    # If z_spread > 0, domestic is overvalued, apply negative correction momentum
     error_correction_bias = -0.5 * z_spread * gk_daily_vol 
     
     last_close = gold_df['Close'].iloc[-1]
     
-    # Dynamic Bounds = Expected Mean Reversion +/- Garman-Klass Deviation
     predicted_mid = last_close * (1 + error_correction_bias)
     breakout_buy = predicted_mid + (last_close * gk_daily_vol * 1.5)
     dynamic_stop = predicted_mid - (last_close * gk_daily_vol * 1.5)
@@ -280,7 +299,7 @@ def process_symbol_chunk(symbols):
         df = fetch_single_ticker_with_retry(f"{sym}.NS", p1, p2, session)
         if not df.empty:
             price_data[f"{sym}.NS"] = df['Close']
-        time.sleep(0.5)
+        time.sleep(1.0) # Explicit chunk delay to satisfy Yahoo rate limits
 
     try:
         with sync_playwright() as p:
