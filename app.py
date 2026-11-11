@@ -5,8 +5,6 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import io
 import re
 import math
@@ -72,7 +70,7 @@ st.title("🏛️ Asymmetric Power Law & Macro Correlation Engine")
 # Session State Initialization (For Background Queue)
 # ==========================================
 if 'portfolio_sweeps' not in st.session_state:
-    st.session_state.portfolio_sweeps = pd.DataFrame(columns=['Date', 'Trade_Profit_INR', 'Sweep_Amount_INR', 'Gold_ETF_Price', 'Units_Accumulated'])
+    st.session_state.portfolio_sweeps = pd.DataFrame(columns=['Date', 'Gross_Equity_Profit', 'Net_Post_Tax_Profit', 'Sweep_Amount_INR', 'Gold_ETF_Price', 'Units_Accumulated'])
 if 'total_gold_units' not in st.session_state:
     st.session_state.total_gold_units = 0.0
 
@@ -86,89 +84,78 @@ if "total_to_process" not in st.session_state:
     st.session_state.total_to_process = 0
 
 # ==========================================
-# 2. Sequential Resilient Market Data Fetcher
+# 2. Universal Resilient YFinance Fetcher
 # ==========================================
-def get_fast_session():
-    session = requests.Session()
-    # Explicit Exponential Backoff Configuration for 429 Errors
-    retry = Retry(
-        connect=4, 
-        backoff_factor=1.5, 
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"]
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    })
-    return session
+def robust_yf_fetch(ticker, days=250):
+    """
+    Bypasses raw requests to v8/chart to avoid 401/403 Cloud IP blocks.
+    Relies purely on yfinance's internal crumb manager with exponential backoff.
+    Alternates between history() and download() APIs.
+    """
+    for attempt in range(4):
+        # Approach 1: Ticker.history (Native crumb handling)
+        try:
+            t = yf.Ticker(ticker)
+            df = t.history(period=f"{days}d")
+            if not df.empty and 'Close' in df.columns:
+                # Strip timezones to prevent joining errors
+                if df.index.tz is not None:
+                    df.index = df.index.tz_localize(None).normalize()
+                return df[['Open', 'High', 'Low', 'Close']]
+        except Exception:
+            pass
+        
+        time.sleep(1.5 ** attempt) # Exponential Backoff
+        
+        # Approach 2: yf.download fallback
+        try:
+            end = datetime.today()
+            start = end - timedelta(days=days)
+            df = yf.download(ticker, start=start, end=end, progress=False)
+            if not df.empty:
+                # Handle MultiIndex columns from newer yfinance versions (>=0.2.40)
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = [col[0] for col in df.columns]
+                if df.index.tz is not None:
+                    df.index = df.index.tz_localize(None).normalize()
+                if 'Close' in df.columns:
+                    return df[['Open', 'High', 'Low', 'Close']]
+        except Exception:
+            pass
+            
+        time.sleep(1.5 ** attempt)
+        
+    return pd.DataFrame()
 
 @st.cache_data(ttl=86400)
 def fetch_nse_index_tickers(index_name="nifty50"):
     url = f"https://nsearchives.nseindia.com/content/indices/ind_{index_name}list.csv"
     try:
-        r = get_fast_session().get(url, timeout=5)
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
         if r.status_code == 200:
             return pd.read_csv(io.StringIO(r.text))["Symbol"].tolist()
     except Exception:
         pass
     return ["RECLTD", "PFC", "ZOMATO", "TATASTEEL", "ITC", "WIPRO", "ONGC"] 
 
-def fetch_single_ticker_with_retry(ticker, p1, p2, session):
-    """
-    Robust fetcher with explicit rate-limit (429) backoff handling and
-    endpoint rotation to ensure successful fetches on free-tier cloud IPs.
-    """
-    endpoints = [
-        f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?period1={p1}&period2={p2}&interval=1d",
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?period1={p1}&period2={p2}&interval=1d"
-    ]
-    for attempt in range(3):
-        for url in endpoints:
-            try:
-                res = session.get(url, timeout=5)
-                if res.status_code == 200:
-                    result = res.json().get('chart', {}).get('result', [])
-                    if result:
-                        ts = result[0].get('timestamp', [])
-                        indicators = result[0]['indicators']['quote'][0]
-                        # Capture OHLC for Garman-Klass
-                        o, h, l, c = indicators.get('open', []), indicators.get('high', []), indicators.get('low', []), indicators.get('close', [])
-                        valid_data = [(t_stamp, o_val, h_val, l_val, c_val) for t_stamp, o_val, h_val, l_val, c_val in zip(ts, o, h, l, c) if c_val is not None]
-                        if valid_data:
-                            v_ts, v_o, v_h, v_l, v_c = zip(*valid_data)
-                            dates = pd.to_datetime(v_ts, unit='s').dt.date
-                            return pd.DataFrame({'Open': v_o, 'High': v_h, 'Low': v_l, 'Close': v_c}, index=dates)
-                elif res.status_code == 429: # Explicitly catch and sleep for rate limits
-                    time.sleep(2 ** attempt)
-            except Exception:
-                continue
-    return pd.DataFrame()
-
 @st.cache_data(ttl=3600)
 def fetch_macro_data(days=250):
-    """Sequential fetching with programmatic sleep to bypass Yahoo rate limits."""
+    """Sequential fetching with programmatic sleep and robust YF methods."""
     tickers = ["DX-Y.NYB", "BZ=F", "^NSEI", "GOLDIETF.NS", "INR=X", "EURUSD=X", "GBPUSD=X", "JPY=X", "GC=F"]
-    session = get_fast_session()
-    
-    end_date = datetime.today()
-    start_date = end_date - timedelta(days=days)
-    p1, p2 = int(start_date.timestamp()), int(end_date.timestamp())
     
     macro_close_dict = {}
     ohlc_dict = {}
     
     for t in tickers:
-        df = fetch_single_ticker_with_retry(t, p1, p2, session)
+        df = robust_yf_fetch(t, days)
         if not df.empty:
             macro_close_dict[t] = df['Close']
             ohlc_dict[t] = df
-        # Explicit Throttle: Ensures we never trigger Yahoo's concurrent connection tarpit
-        time.sleep(1.0)
+        # Explicit Throttle: Ensures we never trigger Yahoo's connection tarpit
+        time.sleep(1.5)
                 
     if macro_close_dict:
+        # Ffill handles slight date mismatches (e.g. US holidays vs Indian holidays)
         merged_close = pd.DataFrame(macro_close_dict).ffill().dropna()
         return merged_close, ohlc_dict
     return pd.DataFrame(), {}
@@ -289,14 +276,10 @@ def extract_screener_playwright(symbol, page):
 def process_symbol_chunk(symbols):
     """Processes a chunk of symbols sequentially to avoid 429 timeouts."""
     records = []
-    session = get_fast_session()
-    end_date = datetime.today()
-    start_date = end_date - timedelta(days=200)
-    p1, p2 = int(start_date.timestamp()), int(end_date.timestamp())
     
     price_data = {}
     for sym in symbols:
-        df = fetch_single_ticker_with_retry(f"{sym}.NS", p1, p2, session)
+        df = robust_yf_fetch(f"{sym}.NS", 200)
         if not df.empty:
             price_data[f"{sym}.NS"] = df['Close']
         time.sleep(1.0) # Explicit chunk delay to satisfy Yahoo rate limits
@@ -310,14 +293,12 @@ def process_symbol_chunk(symbols):
             for sym in symbols:
                 yf_sym = f"{sym}.NS"
                 try:
-                    info_url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{yf_sym}?modules=summaryDetail,defaultKeyStatistics"
+                    # Fallback fundamental grab from yf
                     pe_yf, ev_ebitda_yf = 0.0, 0.0
                     try:
-                        info_res = session.get(info_url, timeout=4)
-                        if info_res.status_code == 200:
-                            res_json = info_res.json().get('quoteSummary', {}).get('result', [{}])[0]
-                            pe_yf = res_json.get('summaryDetail', {}).get('trailingPE', {}).get('raw', 0.0)
-                            ev_ebitda_yf = res_json.get('defaultKeyStatistics', {}).get('enterpriseToEbitda', {}).get('raw', 0.0)
+                        info = yf.Ticker(yf_sym).info
+                        pe_yf = info.get("trailingPE", 0.0)
+                        ev_ebitda_yf = info.get("enterpriseToEbitda", 0.0)
                     except: pass
                     
                     screener_data = extract_screener_playwright(sym, page)
@@ -410,7 +391,7 @@ def fetch_sentiment_data() -> float:
 # ==========================================
 tab1, tab2, tab3 = st.tabs(["📊 Macro & Gold ETF Trading", "📈 Background Equity Ranker", "💰 Wealth Accumulation Sweep"])
 
-with st.spinner("Fetching Market Data sequentially..."):
+with st.spinner("Fetching Market Data sequentially (Bypassing API Rate Limits)..."):
     macro_df, ohlc_dict = fetch_macro_data(days=250)
     advanced_bounds = calculate_advanced_gold_bounds(macro_df, ohlc_dict)
 
@@ -485,7 +466,7 @@ with tab1:
                 fig_corr.update_layout(margin=dict(l=20, r=20, t=20, b=20), paper_bgcolor="rgba(0,0,0,0)")
                 st.plotly_chart(fig_corr, use_container_width=True)
     else:
-        st.error("Insufficient macroeconomic data retrieved. API may be rate-limited.")
+        st.error("Insufficient macroeconomic data retrieved. Yahoo API is heavily rate-limiting this Cloud IP.")
         macro_multiplier, gold_px = 1.0, 0.0
 
 # --- TAB 2: BACKGROUND EQUITY RANKER ---
@@ -525,7 +506,7 @@ with tab2:
             if not chunk_df.empty:
                 st.session_state.bg_results = pd.concat([st.session_state.bg_results, chunk_df], ignore_index=True)
                 
-            time.sleep(2) # Give the server breathing room
+            time.sleep(2.0) # Give the server breathing room
             st.rerun()
             
         else:
