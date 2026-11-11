@@ -18,7 +18,6 @@ from playwright.sync_api import sync_playwright
 import nest_asyncio
 import feedparser
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-import concurrent.futures
 
 # ==========================================
 # 0. Infrastructure & OS Patches
@@ -70,7 +69,7 @@ st.title("🏛️ Asymmetric Power Law & Macro Correlation Engine")
 # Session State Initialization (For Background Queue)
 # ==========================================
 if 'portfolio_sweeps' not in st.session_state:
-    st.session_state.portfolio_sweeps = pd.DataFrame(columns=['Date', 'Trade_Profit_INR', 'Sweep_Amount_INR', 'Gold_ETF_Price', 'Units_Accumulated'])
+    st.session_state.portfolio_sweeps = pd.DataFrame(columns=['Date', 'Gross_Equity_Profit', 'Net_Post_Tax_Profit', 'Sweep_Amount_INR', 'Gold_ETF_Price', 'Units_Accumulated'])
 if 'total_gold_units' not in st.session_state:
     st.session_state.total_gold_units = 0.0
 
@@ -84,20 +83,48 @@ if "total_to_process" not in st.session_state:
     st.session_state.total_to_process = 0
 
 # ==========================================
-# 2. Ultra-Fast Resilient Market Data Fetcher
+# 2. Resilient Chunked Market Data Fetcher
 # ==========================================
 def get_fast_session():
-    """Creates a session optimized for speed to prevent UI hangs."""
+    """Creates a robust requests session."""
     session = requests.Session()
-    retry = Retry(connect=2, backoff_factor=0.2, status_forcelist=[429, 500, 502, 503, 504])
+    retry = Retry(connect=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'application/json'
     })
     return session
+
+def fetch_single_ticker_with_retry(ticker, p1, p2, session, max_attempts=4):
+    """Fetches a single ticker with explicit exponential backoff for rate limits."""
+    endpoints = [
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?period1={p1}&period2={p2}&interval=1d",
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?period1={p1}&period2={p2}&interval=1d"
+    ]
+    
+    for attempt in range(max_attempts):
+        for url in endpoints:
+            try:
+                res = session.get(url, timeout=5)
+                if res.status_code == 200:
+                    result = res.json().get('chart', {}).get('result', [])
+                    if result:
+                        ts = result[0].get('timestamp', [])
+                        closes = result[0]['indicators']['quote'][0].get('close', [])
+                        valid_data = [(t_stamp, c) for t_stamp, c in zip(ts, closes) if c is not None]
+                        if valid_data:
+                            v_ts, v_c = zip(*valid_data)
+                            dates = pd.to_datetime(v_ts, unit='s').dt.date
+                            return pd.DataFrame({ticker: v_c}, index=dates)
+                elif res.status_code == 429: # Rate Limited
+                    time.sleep(2 ** attempt) # Exponential Backoff (1s, 2s, 4s, 8s)
+            except Exception:
+                pass
+        time.sleep(0.5)
+    return pd.DataFrame()
 
 @st.cache_data(ttl=86400)
 def fetch_nse_index_tickers(index_name="nifty50"):
@@ -110,32 +137,9 @@ def fetch_nse_index_tickers(index_name="nifty50"):
         pass
     return ["RECLTD", "PFC", "ZOMATO", "TATASTEEL", "ITC", "WIPRO", "ONGC"] 
 
-def fetch_single_ticker(ticker, p1, p2, session):
-    """Fetches a single ticker directly from Yahoo REST API with strict timeouts."""
-    endpoints = [
-        f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?period1={p1}&period2={p2}&interval=1d",
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?period1={p1}&period2={p2}&interval=1d"
-    ]
-    for url in endpoints:
-        try:
-            res = session.get(url, timeout=3)
-            if res.status_code == 200:
-                result = res.json().get('chart', {}).get('result', [])
-                if result:
-                    ts = result[0].get('timestamp', [])
-                    closes = result[0]['indicators']['quote'][0].get('close', [])
-                    valid_data = [(t_stamp, c) for t_stamp, c in zip(ts, closes) if c is not None]
-                    if valid_data:
-                        v_ts, v_c = zip(*valid_data)
-                        dates = pd.to_datetime(v_ts, unit='s').dt.date
-                        return pd.DataFrame({ticker: v_c}, index=dates)
-        except Exception:
-            continue
-    return pd.DataFrame()
-
 @st.cache_data(ttl=3600)
 def fetch_macro_data(days=250):
-    """Concurrent, resilient macro fetcher."""
+    """Sequential batch-fetcher to avoid triggering Yahoo 429 Rate Limits."""
     tickers = ["DX-Y.NYB", "BZ=F", "^NSEI", "GOLDIETF.NS", "INR=X", "EURUSD=X", "GBPUSD=X", "JPY=X"]
     session = get_fast_session()
     
@@ -145,12 +149,12 @@ def fetch_macro_data(days=250):
     
     data_frames = []
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(fetch_single_ticker, t, p1, p2, session): t for t in tickers}
-        for future in concurrent.futures.as_completed(futures):
-            df = future.result()
-            if not df.empty:
-                data_frames.append(df)
+    # Process sequentially instead of concurrently to prevent IP tarpitting
+    for ticker in tickers:
+        df = fetch_single_ticker_with_retry(ticker, p1, p2, session)
+        if not df.empty:
+            data_frames.append(df)
+        time.sleep(0.5) # Explicit spacing between requests
                 
     if data_frames:
         merged_data = data_frames[0]
@@ -161,45 +165,47 @@ def fetch_macro_data(days=250):
     return pd.DataFrame()
 
 @st.cache_data(ttl=1800)
-def fetch_gold_predictions(ticker="GOLDIETF.NS"):
-    """Calculates next-day High/Low execution triggers (ATR Breakouts) and SEBI bands."""
+def fetch_gold_predictions(ticker="GOLDIETF.NS", max_attempts=4):
+    """Calculates next-day execution triggers with retry logic."""
     session = get_fast_session()
-    try:
-        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?range=30d&interval=1d"
-        res = session.get(url, timeout=5)
-        if res.status_code == 200:
-            quote = res.json()['chart']['result'][0]['indicators']['quote'][0]
-            df = pd.DataFrame({
-                'High': quote['high'], 
-                'Low': quote['low'], 
-                'Close': quote['close']
-            }).dropna()
-            
-            df['prev_close'] = df['Close'].shift(1)
-            df['tr1'] = df['High'] - df['Low']
-            df['tr2'] = (df['High'] - df['prev_close']).abs()
-            df['tr3'] = (df['Low'] - df['prev_close']).abs()
-            df['TR'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
-            
-            atr_14 = df['TR'].rolling(14).mean().iloc[-1]
-            last_close = df['Close'].iloc[-1]
-            
-            # Algorithmic Triggers based on Research Architecture
-            buy_stop_breakout = last_close + (0.3 * atr_14)
-            dynamic_stop_loss = last_close - (1.5 * atr_14)
-            sebi_upper_band = last_close * 1.06
-            sebi_lower_band = last_close * 0.94
-            
-            return {
-                "last_close": last_close,
-                "atr": atr_14,
-                "breakout_buy": buy_stop_breakout,
-                "dynamic_stop": dynamic_stop_loss,
-                "sebi_upper": sebi_upper_band,
-                "sebi_lower": sebi_lower_band
-            }
-    except Exception:
-        pass
+    for attempt in range(max_attempts):
+        try:
+            url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?range=30d&interval=1d"
+            res = session.get(url, timeout=5)
+            if res.status_code == 200:
+                quote = res.json()['chart']['result'][0]['indicators']['quote'][0]
+                df = pd.DataFrame({
+                    'High': quote['high'], 
+                    'Low': quote['low'], 
+                    'Close': quote['close']
+                }).dropna()
+                
+                df['prev_close'] = df['Close'].shift(1)
+                df['tr1'] = df['High'] - df['Low']
+                df['tr2'] = (df['High'] - df['prev_close']).abs()
+                df['tr3'] = (df['Low'] - df['prev_close']).abs()
+                df['TR'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+                
+                atr_14 = df['TR'].rolling(14).mean().iloc[-1]
+                last_close = df['Close'].iloc[-1]
+                
+                buy_stop_breakout = last_close + (0.3 * atr_14)
+                dynamic_stop_loss = last_close - (1.5 * atr_14)
+                sebi_upper_band = last_close * 1.06
+                sebi_lower_band = last_close * 0.94
+                
+                return {
+                    "last_close": last_close,
+                    "atr": atr_14,
+                    "breakout_buy": buy_stop_breakout,
+                    "dynamic_stop": dynamic_stop_loss,
+                    "sebi_upper": sebi_upper_band,
+                    "sebi_lower": sebi_lower_band
+                }
+            elif res.status_code == 429:
+                time.sleep(2 ** attempt)
+        except Exception:
+            time.sleep(0.5)
     return {"last_close": 0, "atr": 0, "breakout_buy": 0, "dynamic_stop": 0, "sebi_upper": 0, "sebi_lower": 0}
 
 # ==========================================
@@ -211,7 +217,7 @@ index_choice = st.sidebar.selectbox("Select Target NSE Universe", ["nifty50", "n
 universe_tickers = fetch_nse_index_tickers(index_choice)
 
 with st.sidebar.expander("Equity Universe Selection", expanded=True):
-    st.info("💡 Background Queue Enabled: You can process up to 500 stocks without timeouts.")
+    st.info("💡 Background Queue Enabled: Processes stocks in chunks of 5 with explicit delays to completely avoid rate limits.")
     selected_tickers = st.multiselect("Select NSE Equities (Without .NS)", options=universe_tickers, default=universe_tickers[:10])
 
 with st.sidebar.expander("Composite Signal Weightings"):
@@ -249,7 +255,7 @@ def extract_screener_playwright(symbol, page):
     return fallback_data
 
 def process_symbol_chunk(symbols):
-    """Processes a chunk of symbols for fundamentals and prices."""
+    """Processes a chunk sequentially to prevent API blocks."""
     records = []
     session = get_fast_session()
     
@@ -258,14 +264,16 @@ def process_symbol_chunk(symbols):
     p1, p2 = int(start_date.timestamp()), int(end_date.timestamp())
     
     price_data = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(fetch_single_ticker, f"{s}.NS", p1, p2, session): s for s in symbols}
-        for future in concurrent.futures.as_completed(futures):
-            sym = futures[future]
-            df = future.result()
-            if not df.empty:
-                price_data[f"{sym}.NS"] = df[f"{sym}.NS"]
+    
+    # 1. Fetch Prices Sequentially with retry logic
+    for sym in symbols:
+        yf_sym = f"{sym}.NS"
+        df = fetch_single_ticker_with_retry(yf_sym, p1, p2, session)
+        if not df.empty:
+            price_data[yf_sym] = df[yf_sym]
+        time.sleep(0.5)
 
+    # 2. Extract Fundamentals
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -375,7 +383,7 @@ def fetch_sentiment_data() -> float:
 # ==========================================
 tab1, tab2, tab3 = st.tabs(["📊 Macro & Gold ETF Trading", "📈 Background Equity Ranker", "💰 Wealth Accumulation Sweep"])
 
-with st.spinner("Fetching Ultra-Fast Resilient Market Data..."):
+with st.spinner("Fetching Market Data in Sequential Batches (Avoiding Rate Limits)..."):
     macro_df = fetch_macro_data(days=250)
     gold_preds = fetch_gold_predictions("GOLDIETF.NS")
 
@@ -451,13 +459,13 @@ with tab1:
                 fig_corr.update_layout(margin=dict(l=20, r=20, t=20, b=20), paper_bgcolor="rgba(0,0,0,0)")
                 st.plotly_chart(fig_corr, use_container_width=True)
     else:
-        st.error("Insufficient macroeconomic data retrieved. API may be rate-limited.")
+        st.error("Insufficient macroeconomic data retrieved. Yahoo API is temporarily enforcing strict rate limits.")
         macro_multiplier, gold_px = 1.0, 0.0
 
 # --- TAB 2: BACKGROUND EQUITY RANKER ---
 with tab2:
     st.header(f"Background Power Law Ranker ({index_choice.upper()} Universe)")
-    st.write("Iterative background queue processing to bypass Streamlit Cloud timeouts.")
+    st.write("Processing stocks sequentially in chunks of 5 with explicit delays to bypass YF rate limits.")
     
     col_btn, col_prog = st.columns([1, 3])
     with col_btn:
@@ -491,7 +499,7 @@ with tab2:
             if not chunk_df.empty:
                 st.session_state.bg_results = pd.concat([st.session_state.bg_results, chunk_df], ignore_index=True)
                 
-            time.sleep(1)
+            time.sleep(2) # 2-Second delay between chunks to rest the API connection
             st.rerun()
             
         else:
@@ -527,7 +535,6 @@ with tab3:
         submitted = st.form_submit_button("Execute Profit Sweep")
         
         if submitted and trade_profit > 0 and gold_px > 0:
-            # Union Budget 2024 tax deductions applied before sweeping[cite: 12, 59]
             net_equity_profit = trade_profit * 0.80  # Subtracting 20% STCG
             sweep_amt = net_equity_profit * (profit_sweep_pct / 100.0)
             units_bought = math.floor(sweep_amt / gold_px)
@@ -552,7 +559,7 @@ with tab3:
         st.dataframe(st.session_state.portfolio_sweeps, use_container_width=True)
         
         total_value = st.session_state.total_gold_units * gold_px
-        gold_ltcg = total_value * 0.125 # 12.5% LTCG assumption on exit without indexation[cite: 12, 60]
+        gold_ltcg = total_value * 0.125
         net_liquid_value = total_value - gold_ltcg
         
         st.info(f"**Total Gold Vault Balance:** {st.session_state.total_gold_units} Units | **Gross Market Value:** ₹{total_value:,.2f} | **Net Liquid Value (After 12.5% LTCG):** ₹{net_liquid_value:,.2f}")
