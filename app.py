@@ -5,8 +5,6 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import io
 import re
 import math
@@ -83,54 +81,28 @@ if "total_to_process" not in st.session_state:
     st.session_state.total_to_process = 0
 
 # ==========================================
-# 2. Resilient Chunked Market Data Fetcher
+# 2. Native YFinance Data Fetcher (Crumb/Cookie Bypasser)
 # ==========================================
-def get_fast_session():
-    """Creates a robust requests session."""
-    session = requests.Session()
-    retry = Retry(connect=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json'
-    })
-    return session
-
-def fetch_single_ticker_with_retry(ticker, p1, p2, session, max_attempts=4):
-    """Fetches a single ticker with explicit exponential backoff for rate limits."""
-    endpoints = [
-        f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?period1={p1}&period2={p2}&interval=1d",
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?period1={p1}&period2={p2}&interval=1d"
-    ]
-    
-    for attempt in range(max_attempts):
-        for url in endpoints:
-            try:
-                res = session.get(url, timeout=5)
-                if res.status_code == 200:
-                    result = res.json().get('chart', {}).get('result', [])
-                    if result:
-                        ts = result[0].get('timestamp', [])
-                        closes = result[0]['indicators']['quote'][0].get('close', [])
-                        valid_data = [(t_stamp, c) for t_stamp, c in zip(ts, closes) if c is not None]
-                        if valid_data:
-                            v_ts, v_c = zip(*valid_data)
-                            dates = pd.to_datetime(v_ts, unit='s').dt.date
-                            return pd.DataFrame({ticker: v_c}, index=dates)
-                elif res.status_code == 429: # Rate Limited
-                    time.sleep(2 ** attempt) # Exponential Backoff (1s, 2s, 4s, 8s)
-            except Exception:
-                pass
-        time.sleep(0.5)
+def yf_fetch_history(ticker, period="1y", retries=3):
+    """
+    Uses yfinance's internal history() method which natively generates
+    and passes the required Yahoo cookies and crumbs to bypass 401/429 limits.
+    """
+    for attempt in range(retries):
+        try:
+            hist = yf.Ticker(ticker).history(period=period)
+            if not hist.empty:
+                return hist
+        except Exception:
+            pass
+        time.sleep(1 + attempt)  # Exponential backoff
     return pd.DataFrame()
 
 @st.cache_data(ttl=86400)
 def fetch_nse_index_tickers(index_name="nifty50"):
     url = f"https://nsearchives.nseindia.com/content/indices/ind_{index_name}list.csv"
     try:
-        r = get_fast_session().get(url, timeout=5)
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         if r.status_code == 200:
             return pd.read_csv(io.StringIO(r.text))["Symbol"].tolist()
     except Exception:
@@ -138,23 +110,19 @@ def fetch_nse_index_tickers(index_name="nifty50"):
     return ["RECLTD", "PFC", "ZOMATO", "TATASTEEL", "ITC", "WIPRO", "ONGC"] 
 
 @st.cache_data(ttl=3600)
-def fetch_macro_data(days=250):
-    """Sequential batch-fetcher to avoid triggering Yahoo 429 Rate Limits."""
+def fetch_macro_data():
+    """Sequential macro fetcher using yfinance crumb-handler."""
     tickers = ["DX-Y.NYB", "BZ=F", "^NSEI", "GOLDIETF.NS", "INR=X", "EURUSD=X", "GBPUSD=X", "JPY=X"]
-    session = get_fast_session()
-    
-    end_date = datetime.today()
-    start_date = end_date - timedelta(days=days)
-    p1, p2 = int(start_date.timestamp()), int(end_date.timestamp())
-    
     data_frames = []
     
-    # Process sequentially instead of concurrently to prevent IP tarpitting
     for ticker in tickers:
-        df = fetch_single_ticker_with_retry(ticker, p1, p2, session)
-        if not df.empty:
+        hist = yf_fetch_history(ticker, period="1y")
+        if not hist.empty:
+            df = pd.DataFrame({ticker: hist['Close']})
+            # Normalize timezone to ensure proper joining
+            df.index = df.index.tz_localize(None).normalize()
             data_frames.append(df)
-        time.sleep(0.5) # Explicit spacing between requests
+        time.sleep(0.5)  # Throttle
                 
     if data_frames:
         merged_data = data_frames[0]
@@ -165,47 +133,40 @@ def fetch_macro_data(days=250):
     return pd.DataFrame()
 
 @st.cache_data(ttl=1800)
-def fetch_gold_predictions(ticker="GOLDIETF.NS", max_attempts=4):
-    """Calculates next-day execution triggers with retry logic."""
-    session = get_fast_session()
-    for attempt in range(max_attempts):
-        try:
-            url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?range=30d&interval=1d"
-            res = session.get(url, timeout=5)
-            if res.status_code == 200:
-                quote = res.json()['chart']['result'][0]['indicators']['quote'][0]
-                df = pd.DataFrame({
-                    'High': quote['high'], 
-                    'Low': quote['low'], 
-                    'Close': quote['close']
-                }).dropna()
-                
-                df['prev_close'] = df['Close'].shift(1)
-                df['tr1'] = df['High'] - df['Low']
-                df['tr2'] = (df['High'] - df['prev_close']).abs()
-                df['tr3'] = (df['Low'] - df['prev_close']).abs()
-                df['TR'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
-                
-                atr_14 = df['TR'].rolling(14).mean().iloc[-1]
-                last_close = df['Close'].iloc[-1]
-                
-                buy_stop_breakout = last_close + (0.3 * atr_14)
-                dynamic_stop_loss = last_close - (1.5 * atr_14)
-                sebi_upper_band = last_close * 1.06
-                sebi_lower_band = last_close * 0.94
-                
-                return {
-                    "last_close": last_close,
-                    "atr": atr_14,
-                    "breakout_buy": buy_stop_breakout,
-                    "dynamic_stop": dynamic_stop_loss,
-                    "sebi_upper": sebi_upper_band,
-                    "sebi_lower": sebi_lower_band
-                }
-            elif res.status_code == 429:
-                time.sleep(2 ** attempt)
-        except Exception:
-            time.sleep(0.5)
+def fetch_gold_predictions(ticker="GOLDIETF.NS"):
+    """Calculates next-day execution triggers using yfinance history."""
+    hist = yf_fetch_history(ticker, period="1mo")
+    
+    if not hist.empty:
+        df = pd.DataFrame({
+            'High': hist['High'], 
+            'Low': hist['Low'], 
+            'Close': hist['Close']
+        }).dropna()
+        
+        df['prev_close'] = df['Close'].shift(1)
+        df['tr1'] = df['High'] - df['Low']
+        df['tr2'] = (df['High'] - df['prev_close']).abs()
+        df['tr3'] = (df['Low'] - df['prev_close']).abs()
+        df['TR'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+        
+        atr_14 = df['TR'].rolling(14).mean().iloc[-1]
+        last_close = df['Close'].iloc[-1]
+        
+        buy_stop_breakout = last_close + (0.3 * atr_14)
+        dynamic_stop_loss = last_close - (1.5 * atr_14)
+        sebi_upper_band = last_close * 1.06
+        sebi_lower_band = last_close * 0.94
+        
+        return {
+            "last_close": last_close,
+            "atr": atr_14,
+            "breakout_buy": buy_stop_breakout,
+            "dynamic_stop": dynamic_stop_loss,
+            "sebi_upper": sebi_upper_band,
+            "sebi_lower": sebi_lower_band
+        }
+        
     return {"last_close": 0, "atr": 0, "breakout_buy": 0, "dynamic_stop": 0, "sebi_upper": 0, "sebi_lower": 0}
 
 # ==========================================
@@ -255,22 +216,17 @@ def extract_screener_playwright(symbol, page):
     return fallback_data
 
 def process_symbol_chunk(symbols):
-    """Processes a chunk sequentially to prevent API blocks."""
+    """Processes a chunk sequentially using yfinance history() wrapper."""
     records = []
-    session = get_fast_session()
-    
-    end_date = datetime.today()
-    start_date = end_date - timedelta(days=200)
-    p1, p2 = int(start_date.timestamp()), int(end_date.timestamp())
     
     price_data = {}
     
-    # 1. Fetch Prices Sequentially with retry logic
+    # 1. Fetch Prices Sequentially 
     for sym in symbols:
         yf_sym = f"{sym}.NS"
-        df = fetch_single_ticker_with_retry(yf_sym, p1, p2, session)
-        if not df.empty:
-            price_data[yf_sym] = df[yf_sym]
+        hist = yf_fetch_history(yf_sym, period="1y")
+        if not hist.empty:
+            price_data[yf_sym] = hist['Close']
         time.sleep(0.5)
 
     # 2. Extract Fundamentals
@@ -283,15 +239,10 @@ def process_symbol_chunk(symbols):
             for sym in symbols:
                 yf_sym = f"{sym}.NS"
                 try:
-                    info_url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{yf_sym}?modules=summaryDetail,defaultKeyStatistics"
-                    pe_yf, ev_ebitda_yf = 0.0, 0.0
-                    try:
-                        info_res = session.get(info_url, timeout=3)
-                        if info_res.status_code == 200:
-                            res_json = info_res.json().get('quoteSummary', {}).get('result', [{}])[0]
-                            pe_yf = res_json.get('summaryDetail', {}).get('trailingPE', {}).get('raw', 0.0)
-                            ev_ebitda_yf = res_json.get('defaultKeyStatistics', {}).get('enterpriseToEbitda', {}).get('raw', 0.0)
-                    except: pass
+                    ticker_obj = yf.Ticker(yf_sym)
+                    info = ticker_obj.info
+                    pe_yf = info.get("trailingPE", 0.0)
+                    ev_ebitda_yf = info.get("enterpriseToEbitda", 0.0)
                     
                     screener_data = extract_screener_playwright(sym, page)
                     
@@ -384,7 +335,7 @@ def fetch_sentiment_data() -> float:
 tab1, tab2, tab3 = st.tabs(["📊 Macro & Gold ETF Trading", "📈 Background Equity Ranker", "💰 Wealth Accumulation Sweep"])
 
 with st.spinner("Fetching Market Data in Sequential Batches (Avoiding Rate Limits)..."):
-    macro_df = fetch_macro_data(days=250)
+    macro_df = fetch_macro_data()
     gold_preds = fetch_gold_predictions("GOLDIETF.NS")
 
 # --- TAB 1: MACRO & GOLD ---
