@@ -5,6 +5,8 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import io
 import re
 import math
@@ -25,8 +27,11 @@ nest_asyncio.apply()
 @st.cache_resource
 def install_playwright():
     """Safely installs Chromium without blocking the main Streamlit thread."""
-    os.system("playwright install chromium")
-    os.system("playwright install-deps")
+    try:
+        os.system("playwright install chromium")
+        os.system("playwright install-deps")
+    except:
+        pass
 
 install_playwright()
 
@@ -67,7 +72,7 @@ st.title("🏛️ Asymmetric Power Law & Macro Correlation Engine")
 # Session State Initialization (For Background Queue)
 # ==========================================
 if 'portfolio_sweeps' not in st.session_state:
-    st.session_state.portfolio_sweeps = pd.DataFrame(columns=['Date', 'Gross_Equity_Profit', 'Net_Post_Tax_Profit', 'Sweep_Amount_INR', 'Gold_ETF_Price', 'Units_Accumulated'])
+    st.session_state.portfolio_sweeps = pd.DataFrame(columns=['Date', 'Trade_Profit_INR', 'Sweep_Amount_INR', 'Gold_ETF_Price', 'Units_Accumulated'])
 if 'total_gold_units' not in st.session_state:
     st.session_state.total_gold_units = 0.0
 
@@ -81,96 +86,143 @@ if "total_to_process" not in st.session_state:
     st.session_state.total_to_process = 0
 
 # ==========================================
-# 2. Native YFinance Data Fetcher (Crumb/Cookie Bypasser)
+# 2. Sequential Resilient Market Data Fetcher
 # ==========================================
-def yf_fetch_history(ticker, period="1y", retries=3):
-    """
-    Uses yfinance's internal history() method which natively generates
-    and passes the required Yahoo cookies and crumbs to bypass 401/429 limits.
-    """
-    for attempt in range(retries):
-        try:
-            hist = yf.Ticker(ticker).history(period=period)
-            if not hist.empty:
-                return hist
-        except Exception:
-            pass
-        time.sleep(1 + attempt)  # Exponential backoff
-    return pd.DataFrame()
+def get_fast_session():
+    session = requests.Session()
+    retry = Retry(connect=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    })
+    return session
 
 @st.cache_data(ttl=86400)
 def fetch_nse_index_tickers(index_name="nifty50"):
     url = f"https://nsearchives.nseindia.com/content/indices/ind_{index_name}list.csv"
     try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        r = get_fast_session().get(url, timeout=5)
         if r.status_code == 200:
             return pd.read_csv(io.StringIO(r.text))["Symbol"].tolist()
     except Exception:
         pass
     return ["RECLTD", "PFC", "ZOMATO", "TATASTEEL", "ITC", "WIPRO", "ONGC"] 
 
-@st.cache_data(ttl=3600)
-def fetch_macro_data():
-    """Sequential macro fetcher using yfinance crumb-handler."""
-    tickers = ["DX-Y.NYB", "BZ=F", "^NSEI", "GOLDIETF.NS", "INR=X", "EURUSD=X", "GBPUSD=X", "JPY=X"]
-    data_frames = []
-    
-    for ticker in tickers:
-        hist = yf_fetch_history(ticker, period="1y")
-        if not hist.empty:
-            df = pd.DataFrame({ticker: hist['Close']})
-            # Normalize timezone to ensure proper joining
-            df.index = df.index.tz_localize(None).normalize()
-            data_frames.append(df)
-        time.sleep(0.5)  # Throttle
-                
-    if data_frames:
-        merged_data = data_frames[0]
-        for df in data_frames[1:]:
-            merged_data = merged_data.join(df, how='outer')
-        return merged_data.ffill().dropna()
-        
+def fetch_single_ticker_with_retry(ticker, p1, p2, session):
+    endpoints = [
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?period1={p1}&period2={p2}&interval=1d",
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?period1={p1}&period2={p2}&interval=1d"
+    ]
+    for attempt in range(2):
+        for url in endpoints:
+            try:
+                res = session.get(url, timeout=4)
+                if res.status_code == 200:
+                    result = res.json().get('chart', {}).get('result', [])
+                    if result:
+                        ts = result[0].get('timestamp', [])
+                        indicators = result[0]['indicators']['quote'][0]
+                        # Capture OHLC for Garman-Klass
+                        o, h, l, c = indicators.get('open', []), indicators.get('high', []), indicators.get('low', []), indicators.get('close', [])
+                        valid_data = [(t_stamp, o_val, h_val, l_val, c_val) for t_stamp, o_val, h_val, l_val, c_val in zip(ts, o, h, l, c) if c_val is not None]
+                        if valid_data:
+                            v_ts, v_o, v_h, v_l, v_c = zip(*valid_data)
+                            dates = pd.to_datetime(v_ts, unit='s').dt.date
+                            return pd.DataFrame({'Open': v_o, 'High': v_h, 'Low': v_l, 'Close': v_c}, index=dates)
+                elif res.status_code == 429:
+                    time.sleep(2 ** attempt) # Exponential backoff
+            except Exception:
+                continue
     return pd.DataFrame()
 
-@st.cache_data(ttl=1800)
-def fetch_gold_predictions(ticker="GOLDIETF.NS"):
-    """Calculates next-day execution triggers using yfinance history."""
-    hist = yf_fetch_history(ticker, period="1mo")
+@st.cache_data(ttl=3600)
+def fetch_macro_data(days=250):
+    """Sequential fetching to respect Yahoo rate limits and extract OHLC."""
+    tickers = ["DX-Y.NYB", "BZ=F", "^NSEI", "GOLDIETF.NS", "INR=X", "EURUSD=X", "GBPUSD=X", "JPY=X", "GC=F"]
+    session = get_fast_session()
     
-    if not hist.empty:
-        df = pd.DataFrame({
-            'High': hist['High'], 
-            'Low': hist['Low'], 
-            'Close': hist['Close']
-        }).dropna()
-        
-        df['prev_close'] = df['Close'].shift(1)
-        df['tr1'] = df['High'] - df['Low']
-        df['tr2'] = (df['High'] - df['prev_close']).abs()
-        df['tr3'] = (df['Low'] - df['prev_close']).abs()
-        df['TR'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
-        
-        atr_14 = df['TR'].rolling(14).mean().iloc[-1]
-        last_close = df['Close'].iloc[-1]
-        
-        buy_stop_breakout = last_close + (0.3 * atr_14)
-        dynamic_stop_loss = last_close - (1.5 * atr_14)
-        sebi_upper_band = last_close * 1.06
-        sebi_lower_band = last_close * 0.94
-        
-        return {
-            "last_close": last_close,
-            "atr": atr_14,
-            "breakout_buy": buy_stop_breakout,
-            "dynamic_stop": dynamic_stop_loss,
-            "sebi_upper": sebi_upper_band,
-            "sebi_lower": sebi_lower_band
-        }
-        
-    return {"last_close": 0, "atr": 0, "breakout_buy": 0, "dynamic_stop": 0, "sebi_upper": 0, "sebi_lower": 0}
+    end_date = datetime.today()
+    start_date = end_date - timedelta(days=days)
+    p1, p2 = int(start_date.timestamp()), int(end_date.timestamp())
+    
+    macro_close_dict = {}
+    ohlc_dict = {}
+    
+    for t in tickers:
+        df = fetch_single_ticker_with_retry(t, p1, p2, session)
+        if not df.empty:
+            macro_close_dict[t] = df['Close']
+            ohlc_dict[t] = df
+        time.sleep(0.3) # Sequential breather to prevent 429 tarpit
+                
+    if macro_close_dict:
+        merged_close = pd.DataFrame(macro_close_dict).ffill().dropna()
+        return merged_close, ohlc_dict
+    return pd.DataFrame(), {}
 
 # ==========================================
-# 3. Sidebar Configuration
+# 3. Garman-Klass & Error Correction Model
+# ==========================================
+def calculate_advanced_gold_bounds(macro_df, ohlc_dict):
+    """Replaces ATR with Garman-Klass volatility and an OLS Error Correction Spread."""
+    if 'GOLDIETF.NS' not in ohlc_dict or 'GC=F' not in macro_df or 'INR=X' not in macro_df:
+        return None
+
+    # 1. Garman-Klass Volatility Calculation
+    gold_df = ohlc_dict['GOLDIETF.NS'].tail(30).copy()
+    gold_df['log_hl'] = np.log(gold_df['High'] / gold_df['Low'])
+    gold_df['log_co'] = np.log(gold_df['Close'] / gold_df['Open'])
+    
+    # GK Formula: 0.5 * (ln(H/L))^2 - (2*ln(2)-1) * (ln(C/O))^2
+    gold_df['gk_var'] = 0.5 * (gold_df['log_hl'] ** 2) - (2 * np.log(2) - 1) * (gold_df['log_co'] ** 2)
+    # 14-day smoothing for stable daily volatility estimate
+    gk_daily_vol = np.sqrt(gold_df['gk_var'].rolling(14).mean().iloc[-1])
+    
+    # 2. Error Correction / Cointegration Spread Model (VECM Proxy)
+    # Compare Domestic Gold (GOLDIETF) to Theoretical Value (Global Gold * USDINR)
+    recent_macro = macro_df.tail(60).copy()
+    y = np.log(recent_macro['GOLDIETF.NS'].values)
+    
+    # Theoretical international proxy value
+    theoretical_int = (recent_macro['GC=F'].values / 31.1035) * recent_macro['INR=X'].values
+    x = np.log(theoretical_int)
+    
+    # OLS Regression
+    beta, alpha = np.polyfit(x, y, 1)
+    
+    # Calculate current spread z-score
+    spread = y - (beta * x + alpha)
+    current_spread = spread[-1]
+    spread_mean = np.mean(spread)
+    spread_std = np.std(spread)
+    
+    z_spread = (current_spread - spread_mean) / spread_std if spread_std > 0 else 0
+    
+    # Error Correction Bias Formulation
+    # If z_spread > 0, domestic is overvalued, apply negative correction momentum
+    error_correction_bias = -0.5 * z_spread * gk_daily_vol 
+    
+    last_close = gold_df['Close'].iloc[-1]
+    
+    # Dynamic Bounds = Expected Mean Reversion +/- Garman-Klass Deviation
+    predicted_mid = last_close * (1 + error_correction_bias)
+    breakout_buy = predicted_mid + (last_close * gk_daily_vol * 1.5)
+    dynamic_stop = predicted_mid - (last_close * gk_daily_vol * 1.5)
+
+    return {
+        "last_close": last_close,
+        "gk_vol_pct": gk_daily_vol * 100,
+        "z_spread": z_spread,
+        "breakout_buy": breakout_buy,
+        "dynamic_stop": dynamic_stop,
+        "sebi_upper": last_close * 1.06,
+        "sebi_lower": last_close * 0.94
+    }
+
+# ==========================================
+# 4. Sidebar Configuration
 # ==========================================
 st.sidebar.header("Strategy Configurations")
 
@@ -178,7 +230,7 @@ index_choice = st.sidebar.selectbox("Select Target NSE Universe", ["nifty50", "n
 universe_tickers = fetch_nse_index_tickers(index_choice)
 
 with st.sidebar.expander("Equity Universe Selection", expanded=True):
-    st.info("💡 Background Queue Enabled: Processes stocks in chunks of 5 with explicit delays to completely avoid rate limits.")
+    st.info("💡 Background Queue Enabled: You can process up to 500 stocks without timeouts.")
     selected_tickers = st.multiselect("Select NSE Equities (Without .NS)", options=universe_tickers, default=universe_tickers[:10])
 
 with st.sidebar.expander("Composite Signal Weightings"):
@@ -191,7 +243,7 @@ with st.sidebar.expander("Gold ETF Sweep Rules"):
     initial_capital = st.number_input("Initial Portfolio Capital (₹)", value=1000000, step=100000)
 
 # ==========================================
-# 4. Power Law Math & Multi-Source Scraper
+# 5. Power Law Math & Multi-Source Scraper
 # ==========================================
 def extract_screener_playwright(symbol, page):
     fallback_data = {"promoter_pledge_pct": 0.0}
@@ -216,20 +268,20 @@ def extract_screener_playwright(symbol, page):
     return fallback_data
 
 def process_symbol_chunk(symbols):
-    """Processes a chunk sequentially using yfinance history() wrapper."""
+    """Processes a chunk of symbols sequentially to avoid 429 timeouts."""
     records = []
+    session = get_fast_session()
+    end_date = datetime.today()
+    start_date = end_date - timedelta(days=200)
+    p1, p2 = int(start_date.timestamp()), int(end_date.timestamp())
     
     price_data = {}
-    
-    # 1. Fetch Prices Sequentially 
     for sym in symbols:
-        yf_sym = f"{sym}.NS"
-        hist = yf_fetch_history(yf_sym, period="1y")
-        if not hist.empty:
-            price_data[yf_sym] = hist['Close']
+        df = fetch_single_ticker_with_retry(f"{sym}.NS", p1, p2, session)
+        if not df.empty:
+            price_data[f"{sym}.NS"] = df['Close']
         time.sleep(0.5)
 
-    # 2. Extract Fundamentals
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -239,10 +291,15 @@ def process_symbol_chunk(symbols):
             for sym in symbols:
                 yf_sym = f"{sym}.NS"
                 try:
-                    ticker_obj = yf.Ticker(yf_sym)
-                    info = ticker_obj.info
-                    pe_yf = info.get("trailingPE", 0.0)
-                    ev_ebitda_yf = info.get("enterpriseToEbitda", 0.0)
+                    info_url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{yf_sym}?modules=summaryDetail,defaultKeyStatistics"
+                    pe_yf, ev_ebitda_yf = 0.0, 0.0
+                    try:
+                        info_res = session.get(info_url, timeout=4)
+                        if info_res.status_code == 200:
+                            res_json = info_res.json().get('quoteSummary', {}).get('result', [{}])[0]
+                            pe_yf = res_json.get('summaryDetail', {}).get('trailingPE', {}).get('raw', 0.0)
+                            ev_ebitda_yf = res_json.get('defaultKeyStatistics', {}).get('enterpriseToEbitda', {}).get('raw', 0.0)
+                    except: pass
                     
                     screener_data = extract_screener_playwright(sym, page)
                     
@@ -260,10 +317,10 @@ def process_symbol_chunk(symbols):
                         "LPPLS t_c (days)": tc_val
                     })
                 except Exception as e:
-                    print(f"Error processing {sym}: {e}")
+                    pass
             browser.close()
-    except Exception as e:
-        print(f"Playwright error in chunk: {e}")
+    except Exception:
+        pass
         
     return pd.DataFrame(records)
 
@@ -330,19 +387,19 @@ def fetch_sentiment_data() -> float:
         return 0.0
 
 # ==========================================
-# 5. UI Rendering & Background Queue Processor
+# 6. UI Rendering & Background Queue Processor
 # ==========================================
 tab1, tab2, tab3 = st.tabs(["📊 Macro & Gold ETF Trading", "📈 Background Equity Ranker", "💰 Wealth Accumulation Sweep"])
 
-with st.spinner("Fetching Market Data in Sequential Batches (Avoiding Rate Limits)..."):
-    macro_df = fetch_macro_data()
-    gold_preds = fetch_gold_predictions("GOLDIETF.NS")
+with st.spinner("Fetching Market Data sequentially..."):
+    macro_df, ohlc_dict = fetch_macro_data(days=250)
+    advanced_bounds = calculate_advanced_gold_bounds(macro_df, ohlc_dict)
 
 # --- TAB 1: MACRO & GOLD ---
 with tab1:
     st.header("Macroeconomic Environment & Gold ETF Execution")
     
-    if not macro_df.empty and 'GOLDIETF.NS' in macro_df.columns:
+    if not macro_df.empty and 'GOLDIETF.NS' in macro_df.columns and advanced_bounds:
         colA, colB, colC, colD = st.columns(4)
         gold_px = macro_df['GOLDIETF.NS'].iloc[-1]
         gold_hurst = compute_hurst(macro_df['GOLDIETF.NS'])
@@ -354,30 +411,29 @@ with tab1:
         colC.metric("LPPLS Criticality", f"{round(gold_tc,1)} days", delta="LIQUIDATION WARNING" if gold_tc <= 30 else "Safe", delta_color="inverse" if gold_tc<=30 else "normal")
         colD.metric("Macro NLP Sentiment", sentiment, delta="Bullish" if sentiment > 0.05 else "Bearish" if sentiment < -0.05 else "Neutral")
 
-        # Predictive Execution Box (SEBI 2026 Bands + Volatility Breakout)
-        if gold_preds["breakout_buy"] > 0:
-            st.markdown(f"""
-            <div class="pred-box">
-                <p style="margin:0; color:#aaa; font-size:14px;">Next Session Algorithmic Execution Triggers (SEBI 2026 Rules & 14-Day ATR)</p>
-                <div style="display:flex; justify-content:space-around; align-items:center; margin-top:10px;">
-                    <div>
-                        <span style="color:#aaa; font-size:12px;">Dynamic Stop Loss (Entry - 1.5 ATR)</span><br>
-                        <span class="pred-low">₹{gold_preds['dynamic_stop']:.2f}</span>
-                        <br><span style="color:#666; font-size:10px;">SEBI Lower Limit: ₹{gold_preds['sebi_lower']:.2f}</span>
-                    </div>
-                    <div>
-                        <span class="pred-neutral">Current ATR: ₹{gold_preds['atr']:.2f}</span><br>
-                        <span style="color:#888; font-size:11px;">(Base SEBI Band: ±6%)</span>
-                    </div>
-                    <div>
-                        <span style="color:#aaa; font-size:12px;">Breakout Buy Trigger (Open + 0.3 ATR)</span><br>
-                        <span class="pred-high">₹{gold_preds['breakout_buy']:.2f}</span>
-                        <br><span style="color:#666; font-size:10px;">SEBI Upper Limit: ₹{gold_preds['sebi_upper']:.2f}</span>
-                    </div>
+        # Predictive Execution Box (Garman-Klass + Error Correction Spread)
+        st.markdown(f"""
+        <div class="pred-box">
+            <p style="margin:0; color:#aaa; font-size:14px;">Next Session Algorithmic Execution Triggers (Garman-Klass Volatility + VECM Spread)</p>
+            <div style="display:flex; justify-content:space-around; align-items:center; margin-top:10px;">
+                <div>
+                    <span style="color:#aaa; font-size:12px;">Dynamic Stop Loss (-1.5x GK)</span><br>
+                    <span class="pred-low">₹{advanced_bounds['dynamic_stop']:.2f}</span>
+                    <br><span style="color:#666; font-size:10px;">SEBI Lower Limit: ₹{advanced_bounds['sebi_lower']:.2f}</span>
+                </div>
+                <div>
+                    <span class="pred-neutral">Daily GK Volatility: {advanced_bounds['gk_vol_pct']:.2f}%</span><br>
+                    <span style="color:#888; font-size:11px;">(Z-Score Spread vs Int. Gold: {advanced_bounds['z_spread']:+.2f})</span>
+                </div>
+                <div>
+                    <span style="color:#aaa; font-size:12px;">Breakout Buy Trigger (+1.5x GK)</span><br>
+                    <span class="pred-high">₹{advanced_bounds['breakout_buy']:.2f}</span>
+                    <br><span style="color:#666; font-size:10px;">SEBI Upper Limit: ₹{advanced_bounds['sebi_upper']:.2f}</span>
                 </div>
             </div>
-            """, unsafe_allow_html=True)
-            st.write("")
+        </div>
+        """, unsafe_allow_html=True)
+        st.write("")
 
         st.markdown("---")
         c1, c2 = st.columns([1, 2])
@@ -410,13 +466,13 @@ with tab1:
                 fig_corr.update_layout(margin=dict(l=20, r=20, t=20, b=20), paper_bgcolor="rgba(0,0,0,0)")
                 st.plotly_chart(fig_corr, use_container_width=True)
     else:
-        st.error("Insufficient macroeconomic data retrieved. Yahoo API is temporarily enforcing strict rate limits.")
+        st.error("Insufficient macroeconomic data retrieved. API may be rate-limited.")
         macro_multiplier, gold_px = 1.0, 0.0
 
 # --- TAB 2: BACKGROUND EQUITY RANKER ---
 with tab2:
     st.header(f"Background Power Law Ranker ({index_choice.upper()} Universe)")
-    st.write("Processing stocks sequentially in chunks of 5 with explicit delays to bypass YF rate limits.")
+    st.write("Iterative background queue processing to bypass Streamlit Cloud timeouts.")
     
     col_btn, col_prog = st.columns([1, 3])
     with col_btn:
@@ -450,7 +506,7 @@ with tab2:
             if not chunk_df.empty:
                 st.session_state.bg_results = pd.concat([st.session_state.bg_results, chunk_df], ignore_index=True)
                 
-            time.sleep(2) # 2-Second delay between chunks to rest the API connection
+            time.sleep(2) # Give the server breathing room
             st.rerun()
             
         else:
@@ -510,7 +566,7 @@ with tab3:
         st.dataframe(st.session_state.portfolio_sweeps, use_container_width=True)
         
         total_value = st.session_state.total_gold_units * gold_px
-        gold_ltcg = total_value * 0.125
+        gold_ltcg = total_value * 0.125 # 12.5% LTCG assumption on exit without indexation
         net_liquid_value = total_value - gold_ltcg
         
         st.info(f"**Total Gold Vault Balance:** {st.session_state.total_gold_units} Units | **Gross Market Value:** ₹{total_value:,.2f} | **Net Liquid Value (After 12.5% LTCG):** ₹{net_liquid_value:,.2f}")
