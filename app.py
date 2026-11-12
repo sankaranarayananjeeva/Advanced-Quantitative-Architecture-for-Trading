@@ -67,7 +67,7 @@ st.markdown("""
 st.title("🏛️ Asymmetric Power Law & Macro Correlation Engine")
 
 # ==========================================
-# Session State Initialization (For Background Queue)
+# Session State Initialization (For Background Queue & History)
 # ==========================================
 if 'portfolio_sweeps' not in st.session_state:
     st.session_state.portfolio_sweeps = pd.DataFrame(columns=['Date', 'Gross_Equity_Profit', 'Net_Post_Tax_Profit', 'Sweep_Amount_INR', 'Gold_ETF_Price', 'Units_Accumulated'])
@@ -82,38 +82,33 @@ if "is_processing" not in st.session_state:
     st.session_state.is_processing = False
 if "total_to_process" not in st.session_state:
     st.session_state.total_to_process = 0
+    
+# NEW: Array to store the last 5 executed runs
+if "run_history" not in st.session_state:
+    st.session_state.run_history = []
 
 # ==========================================
 # 2. Universal Resilient YFinance Fetcher
 # ==========================================
 def robust_yf_fetch(ticker, days=250):
-    """
-    Bypasses raw requests to v8/chart to avoid 401/403 Cloud IP blocks.
-    Relies purely on yfinance's internal crumb manager with exponential backoff.
-    Alternates between history() and download() APIs.
-    """
     for attempt in range(4):
-        # Approach 1: Ticker.history (Native crumb handling)
         try:
             t = yf.Ticker(ticker)
             df = t.history(period=f"{days}d")
             if not df.empty and 'Close' in df.columns:
-                # Strip timezones to prevent joining errors
                 if df.index.tz is not None:
                     df.index = df.index.tz_localize(None).normalize()
                 return df[['Open', 'High', 'Low', 'Close']]
         except Exception:
             pass
         
-        time.sleep(1.5 ** attempt) # Exponential Backoff
+        time.sleep(1.5 ** attempt) 
         
-        # Approach 2: yf.download fallback
         try:
             end = datetime.today()
             start = end - timedelta(days=days)
             df = yf.download(ticker, start=start, end=end, progress=False)
             if not df.empty:
-                # Handle MultiIndex columns from newer yfinance versions (>=0.2.40)
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = [col[0] for col in df.columns]
                 if df.index.tz is not None:
@@ -140,7 +135,6 @@ def fetch_nse_index_tickers(index_name="nifty50"):
 
 @st.cache_data(ttl=3600)
 def fetch_macro_data(days=250):
-    """Sequential fetching with programmatic sleep and robust YF methods."""
     tickers = ["DX-Y.NYB", "BZ=F", "^NSEI", "GOLDIETF.NS", "INR=X", "EURUSD=X", "GBPUSD=X", "JPY=X", "GC=F"]
     
     macro_close_dict = {}
@@ -151,11 +145,9 @@ def fetch_macro_data(days=250):
         if not df.empty:
             macro_close_dict[t] = df['Close']
             ohlc_dict[t] = df
-        # Explicit Throttle: Ensures we never trigger Yahoo's connection tarpit
-        time.sleep(1.5)
+        time.sleep(1.5) 
                 
     if macro_close_dict:
-        # Ffill handles slight date mismatches (e.g. US holidays vs Indian holidays)
         merged_close = pd.DataFrame(macro_close_dict).ffill().dropna()
         return merged_close, ohlc_dict
     return pd.DataFrame(), {}
@@ -164,14 +156,10 @@ def fetch_macro_data(days=250):
 # 3. Garman-Klass & Error Correction Model
 # ==========================================
 def calculate_advanced_gold_bounds(macro_df, ohlc_dict):
-    """Replaces ATR with Garman-Klass volatility and an OLS Error Correction Spread."""
     if 'GOLDIETF.NS' not in ohlc_dict or 'GC=F' not in macro_df or 'INR=X' not in macro_df:
         return None
 
-    # 1. Garman-Klass Volatility Calculation
     gold_df = ohlc_dict['GOLDIETF.NS'].tail(30).copy()
-    
-    # Handle cases where High/Low/Open might be missing or zero to prevent log(0)
     gold_df = gold_df[(gold_df['High'] > 0) & (gold_df['Low'] > 0) & (gold_df['Open'] > 0) & (gold_df['Close'] > 0)]
     
     if len(gold_df) < 14:
@@ -180,35 +168,23 @@ def calculate_advanced_gold_bounds(macro_df, ohlc_dict):
     gold_df['log_hl'] = np.log(gold_df['High'] / gold_df['Low'])
     gold_df['log_co'] = np.log(gold_df['Close'] / gold_df['Open'])
     
-    # GK Formula: 0.5 * (ln(H/L))^2 - (2*ln(2)-1) * (ln(C/O))^2
     gold_df['gk_var'] = 0.5 * (gold_df['log_hl'] ** 2) - (2 * np.log(2) - 1) * (gold_df['log_co'] ** 2)
-    
-    # Ensure variance is positive before square root
     gold_df['gk_var'] = gold_df['gk_var'].clip(lower=0.000001)
-    
-    # 14-day smoothing for stable daily volatility estimate
     gk_daily_vol = np.sqrt(gold_df['gk_var'].rolling(14).mean().iloc[-1])
     
-    # 2. Error Correction / Cointegration Spread Model (VECM Proxy)
     recent_macro = macro_df.tail(60).copy()
     y = np.log(recent_macro['GOLDIETF.NS'].values)
-    
-    # Theoretical international proxy value (GC=F is per troy ounce, 1 troy oz = 31.1034768 grams)
     theoretical_int = (recent_macro['GC=F'].values / 31.1034768) * recent_macro['INR=X'].values
     x = np.log(theoretical_int)
     
-    # OLS Regression
     beta, alpha = np.polyfit(x, y, 1)
     
-    # Calculate current spread z-score
     spread = y - (beta * x + alpha)
     current_spread = spread[-1]
     spread_mean = np.mean(spread)
     spread_std = np.std(spread)
     
     z_spread = (current_spread - spread_mean) / spread_std if spread_std > 0 else 0
-    
-    # Error Correction Bias Formulation
     error_correction_bias = -0.5 * z_spread * gk_daily_vol 
     
     last_close = gold_df['Close'].iloc[-1]
@@ -282,7 +258,7 @@ def process_symbol_chunk(symbols):
         df = robust_yf_fetch(f"{sym}.NS", 200)
         if not df.empty:
             price_data[f"{sym}.NS"] = df['Close']
-        time.sleep(1.0) # Explicit chunk delay to satisfy Yahoo rate limits
+        time.sleep(1.0) 
 
     try:
         with sync_playwright() as p:
@@ -293,7 +269,6 @@ def process_symbol_chunk(symbols):
             for sym in symbols:
                 yf_sym = f"{sym}.NS"
                 try:
-                    # Fallback fundamental grab from yf
                     pe_yf, ev_ebitda_yf = 0.0, 0.0
                     try:
                         info = yf.Ticker(yf_sym).info
@@ -466,7 +441,7 @@ with tab1:
                 fig_corr.update_layout(margin=dict(l=20, r=20, t=20, b=20), paper_bgcolor="rgba(0,0,0,0)")
                 st.plotly_chart(fig_corr, use_container_width=True)
     else:
-        st.error("Insufficient macroeconomic data retrieved. Yahoo API is heavily rate-limiting this Cloud IP.")
+        st.error("Insufficient macroeconomic data retrieved. API may be rate-limited.")
         macro_multiplier, gold_px = 1.0, 0.0
 
 # --- TAB 2: BACKGROUND EQUITY RANKER ---
@@ -506,31 +481,69 @@ with tab2:
             if not chunk_df.empty:
                 st.session_state.bg_results = pd.concat([st.session_state.bg_results, chunk_df], ignore_index=True)
                 
-            time.sleep(2.0) # Give the server breathing room
+            # NEW: Store finalized dataframe to history when the queue finishes
+            if len(st.session_state.bg_queue) == 0:
+                st.session_state.is_processing = False
+                
+                if not st.session_state.bg_results.empty:
+                    fund_df = st.session_state.bg_results.copy()
+                    fund_df["Z_Fund"] = compute_zscore(fund_df["ROCE (%)"]) + compute_zscore(fund_df["EV/EBITDA"], invert=True)
+                    fund_df["Z_PLCS"] = compute_zscore(fund_df["Hurst (100d)"]) + compute_zscore(fund_df["LPPLS t_c (days)"], invert=True)
+                    fund_df["Composite Score"] = ((w_fund/100) * fund_df["Z_Fund"] + (w_plcs/100) * fund_df["Z_PLCS"]) * macro_multiplier
+                    fund_df["Liquidation Alert"] = np.where((fund_df["LPPLS t_c (days)"] <= 30) & (fund_df["Hurst (100d)"] <= 0.55), True, False)
+                    
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    st.session_state.run_history.append({"time": timestamp, "data": fund_df})
+                    
+                    # Enforce a maximum of 5 historical runs in memory
+                    if len(st.session_state.run_history) > 5:
+                        st.session_state.run_history = st.session_state.run_history[-5:]
+                        
+                    # Save a local CSV backup
+                    os.makedirs("history", exist_ok=True)
+                    safe_time = timestamp.replace(":", "-").replace(" ", "_")
+                    fund_df.to_csv(f"history/run_{safe_time}.csv", index=False)
+            
+            time.sleep(1.0) 
             st.rerun()
             
         else:
             st.session_state.is_processing = False
             st.success("Background Execution Complete!")
 
-    if not st.session_state.bg_results.empty:
-        fund_df = st.session_state.bg_results.copy()
+    # Display Current Run (if available and not processing)
+    if not st.session_state.bg_results.empty and not st.session_state.is_processing:
+        st.write("### Latest Computed Rankings")
+        latest_df = st.session_state.run_history[-1]["data"] if st.session_state.run_history else pd.DataFrame()
+        if not latest_df.empty:
+            st.dataframe(
+                latest_df.sort_values(by="Composite Score", ascending=False),
+                column_config={
+                    "Hurst (100d)": st.column_config.NumberColumn(format="%.3f"),
+                    "LPPLS t_c (days)": st.column_config.NumberColumn(format="%.1f"),
+                    "Composite Score": st.column_config.NumberColumn(format="%.3f"),
+                },
+                use_container_width=True, hide_index=True
+            )
+
+    # NEW: Run History Dropdown Feature
+    if len(st.session_state.run_history) > 0 and not st.session_state.is_processing:
+        st.markdown("---")
+        st.subheader("🕰️ Historical Runs (Last 5)")
+        history_options = {f"Run at {run['time']} ({len(run['data'])} stocks)": run['data'] for run in reversed(st.session_state.run_history)}
+        selected_hist = st.selectbox("Select a previous run to view:", list(history_options.keys()))
         
-        fund_df["Z_Fund"] = compute_zscore(fund_df["ROCE (%)"]) + compute_zscore(fund_df["EV/EBITDA"], invert=True)
-        fund_df["Z_PLCS"] = compute_zscore(fund_df["Hurst (100d)"]) + compute_zscore(fund_df["LPPLS t_c (days)"], invert=True)
-        fund_df["Composite Score"] = ((w_fund/100) * fund_df["Z_Fund"] + (w_plcs/100) * fund_df["Z_PLCS"]) * macro_multiplier
-        fund_df["Liquidation Alert"] = np.where((fund_df["LPPLS t_c (days)"] <= 30) & (fund_df["Hurst (100d)"] <= 0.55), True, False)
-        
-        st.write(f"### Final Computed Rankings ({len(fund_df)} Stocks Analyzed)")
-        st.dataframe(
-            fund_df.sort_values(by="Composite Score", ascending=False),
-            column_config={
-                "Hurst (100d)": st.column_config.NumberColumn(format="%.3f"),
-                "LPPLS t_c (days)": st.column_config.NumberColumn(format="%.1f"),
-                "Composite Score": st.column_config.NumberColumn(format="%.3f"),
-            },
-            use_container_width=True, hide_index=True
-        )
+        if selected_hist:
+            hist_df = history_options[selected_hist]
+            st.dataframe(
+                hist_df.sort_values(by="Composite Score", ascending=False),
+                column_config={
+                    "Hurst (100d)": st.column_config.NumberColumn(format="%.3f"),
+                    "LPPLS t_c (days)": st.column_config.NumberColumn(format="%.1f"),
+                    "Composite Score": st.column_config.NumberColumn(format="%.3f"),
+                },
+                use_container_width=True, hide_index=True
+            )
 
 # --- TAB 3: SWEEP CALCULATOR ---
 with tab3:
